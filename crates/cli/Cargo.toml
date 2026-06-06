@@ -19,7 +19,13 @@ anyhow = { workspace = true }
 webpki-roots = { workspace = true }
 dirs = "5"
 common = { path = "../common" }
-ureq = { version = "3.3.0", features = ["json"] }
+# Avoid ureq's `rustls` feature: it pulls in `ring`, conflicting with our
+# workspace `rustls` (aws-lc-rs only). `rustls-no-provider` reuses that dep.
+ureq = { version = "3.3.0", default-features = false, features = [
+    "json",
+    "rustls-no-provider",
+    "rustls-webpki-roots",
+] }
 semver = "1.0.28"
 self-replace = "1.5.0"
 tempfile = "3.27.0"

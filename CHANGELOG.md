@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- CLI panic on `borehole config` / `borehole update` (`CryptoProvider` / `ring` vs
+  `aws-lc-rs` conflict): pin workspace `rustls` to `aws-lc-rs` only, configure
+  `ureq` with `rustls-no-provider` (no `ring`), and install the default
+  `aws-lc-rs` provider at startup.
+
 ## [0.1.0] - 2026-06-06
 
 ### Fixed

@@ -104,6 +104,12 @@ Workspace members (declared in root `Cargo.toml`):
 - Version exchange: `Register.client_version` and `Registered.server_version`
   (both `#[serde(default)]`, empty = unknown/legacy peer). Server logs the
   client version; CLI warns on mismatch at `start`.
+- GOTCHA: `ureq`'s default `rustls` feature enables `ring`, which conflicts with
+  workspace `rustls` (`aws-lc-rs` via tokio-rustls) and panics at runtime
+  (`CryptoProvider` not installed). Fix: `ureq` with `default-features = false`,
+  features `["json", "rustls-no-provider", "rustls-webpki-roots"]`; workspace
+  `rustls` with `default-features = false, features = ["aws-lc-rs", ...]`; call
+  `rustls::crypto::aws_lc_rs::default_provider().install_default()` in `main`.
 - `cli::update` (uses `ureq` 3.x, `semver`, `self-replace`, `tempfile`):
   - `check_newer()` -> `Option<String>`: best-effort GitHub latest-release
     compare. `tunnel::run` calls it post-banner via `spawn_blocking` + 3s

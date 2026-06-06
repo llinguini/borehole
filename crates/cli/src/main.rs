@@ -51,6 +51,12 @@ enum StartCmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // rustls 0.23 needs an explicit default when multiple crypto backends could
+    // be linked; we standardise on aws-lc-rs (same as tokio-rustls / ureq).
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("failed to install rustls crypto provider");
+
     match Cli::parse() {
         Cli::Config { server, token } => run_config(server, token).await,
         Cli::Start { protocol } => run_start(protocol).await,
