@@ -92,6 +92,30 @@ Workspace members (declared in root `Cargo.toml`):
   Depends on `common` (path) plus `tokio`, `tokio-rustls`, `rustls`, `serde`,
   `serde_json`, `uuid` (workspace).
 
+## Versioning & self-update
+
+- Single source of truth: `[workspace.package] version` in the root
+  `Cargo.toml` (currently `0.1.0`); members inherit via `version.workspace`.
+- `crates/cli/build.rs` and `crates/server/build.rs` emit
+  `cargo:rustc-env=BOREHOLE_VERSION`, preferring the `BOREHOLE_VERSION` env
+  (CI sets it to the tag, leading `v` stripped) and falling back to
+  `CARGO_PKG_VERSION`. Code reads `const VERSION = env!("BOREHOLE_VERSION")`
+  (`crate::VERSION` in both binaries). clap uses `version = VERSION`.
+- Version exchange: `Register.client_version` and `Registered.server_version`
+  (both `#[serde(default)]`, empty = unknown/legacy peer). Server logs the
+  client version; CLI warns on mismatch at `start`.
+- `cli::update` (uses `ureq` 3.x, `semver`, `self-replace`, `tempfile`):
+  - `check_newer()` -> `Option<String>`: best-effort GitHub latest-release
+    compare. `tunnel::run` calls it post-banner via `spawn_blocking` + 3s
+    timeout, ignoring all errors.
+  - `borehole update` (`update::run`, on `spawn_blocking`): downloads the asset
+    for the current OS/arch (same mapping as `install.sh`; Linux x86_64 = musl)
+    and replaces the running exe via `self_replace`. GOTCHA: ureq 3 body reads
+    cap at 10MB by default -> use `.with_config().limit(...).read_to_vec()`.
+- CI injects the tag: `build-cli` sets `env.BOREHOLE_VERSION`, the `docker` job
+  passes `build-args: BOREHOLE_VERSION=...` and the Dockerfile has a matching
+  `ARG`/`ENV` before `cargo build`. Keep `Cargo.toml` version == tag.
+
 ## Build configuration
 
 - `resolver = "2"`.
@@ -130,9 +154,8 @@ Workspace members (declared in root `Cargo.toml`):
   server's `Config` struct does NOT define; serde ignores unknown fields (no
   `deny_unknown_fields`), so it parses fine but `bind_http` is inert — there is
   no HTTP plane yet (the `http` protocol only changes the CLI banner URL).
-- `.github/ISSUE_TEMPLATE/bug_report.md`: bug template. CAVEAT: it references
-  `borehole --version`, but the clap command has no `version` set yet, so that
-  flag is unsupported until `#[command(version)]` is added.
+- `.github/ISSUE_TEMPLATE/bug_report.md`: bug template referencing
+  `borehole --version` (now supported via `#[command(version = VERSION)]`).
 
 ## Docs
 
@@ -195,8 +218,8 @@ Workspace members (declared in root `Cargo.toml`):
 - `ClientMsg` (client -> server) is an internally-tagged enum
   (`#[serde(tag = "type", rename_all = "snake_case")]`):
   - `Register`: `token`, `protocol` ("tcp"|"http"), `local_port: u16`,
-    `remote_port: Option<u16>` (null => server assigns a random port). Tag:
-    `"register"`.
+    `remote_port: Option<u16>` (null => server assigns a random port),
+    `client_version` (`#[serde(default)]`). Tag: `"register"`.
   - `DataConn`: `conn_id: String` (UUID v4 echoed from server's `NewConn`). Tag:
     `"data_conn"`.
   - `Ping`: `token`. Side-effect-free probe: server validates the token and
@@ -204,8 +227,8 @@ Workspace members (declared in root `Cargo.toml`):
     Tag: `"ping"`. Used by `borehole config` to validate TLS + token.
 - `ServerMsg` (server -> client) is an internally-tagged enum
   (`#[serde(tag = "type", rename_all = "snake_case")]`):
-  - `Registered`: `remote_port: u16` (port assigned to the tunnel). Tag:
-    `"registered"`.
+  - `Registered`: `remote_port: u16` (port assigned to the tunnel),
+    `server_version` (`#[serde(default)]`). Tag: `"registered"`.
   - `NewConn`: `conn_id: String` (UUID v4 for the incoming connection). Tag:
     `"new_conn"`.
   - `Pong`: unit variant, serializes as `{"type":"pong"}`. Success reply to a

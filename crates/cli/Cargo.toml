@@ -1,5 +1,6 @@
 [package]
 name = "cli"
+version.workspace = true
 edition = "2021"
 
 [[bin]]
@@ -18,3 +19,7 @@ anyhow = { workspace = true }
 webpki-roots = { workspace = true }
 dirs = "5"
 common = { path = "../common" }
+ureq = { version = "3.3.0", features = ["json"] }
+semver = "1.0.28"
+self-replace = "1.5.0"
+tempfile = "3.27.0"

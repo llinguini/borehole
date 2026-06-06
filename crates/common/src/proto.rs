@@ -19,6 +19,11 @@ pub struct Register {
     /// Desired public port on the server. `None` lets the server pick a
     /// random free port.
     pub remote_port: Option<u16>,
+    /// Client (CLI) version, e.g. "0.1.0". Empty when talking to/from an older
+    /// build that predates version reporting. `#[serde(default)]` keeps the
+    /// wire format backward compatible.
+    #[serde(default)]
+    pub client_version: String,
 }
 
 /// Sent by the client over a freshly opened second TCP connection to bind it
@@ -57,6 +62,10 @@ pub enum ClientMsg {
 pub struct Registered {
     /// Public port the server assigned to the tunnel.
     pub remote_port: u16,
+    /// Server version, e.g. "0.1.0". Empty when the server predates version
+    /// reporting. `#[serde(default)]` keeps the wire format backward compatible.
+    #[serde(default)]
+    pub server_version: String,
 }
 
 /// Notifies the client that an external connection reached the tunnel's public
@@ -120,11 +129,25 @@ mod tests {
             protocol: "tcp".to_string(),
             local_port: 8080,
             remote_port: None,
+            client_version: "0.1.0".to_string(),
         });
 
         let json = serde_json::to_string(&msg).expect("serialization must succeed");
 
         assert!(json.contains(r#""type":"register""#), "got: {json}");
+    }
+
+    #[test]
+    fn register_without_version_deserializes() {
+        // Older clients omit `client_version`; it must default to empty.
+        let json = r#"{"type":"register","token":"t","protocol":"tcp","local_port":80,"remote_port":null}"#;
+
+        let msg: ClientMsg = serde_json::from_str(json).expect("deserialization must succeed");
+
+        match msg {
+            ClientMsg::Register(reg) => assert_eq!(reg.client_version, ""),
+            other => panic!("expected Register, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -141,12 +164,28 @@ mod tests {
 
     #[test]
     fn registered_serializes_with_type_and_port() {
-        let msg = ServerMsg::Registered(Registered { remote_port: 32847 });
+        let msg = ServerMsg::Registered(Registered {
+            remote_port: 32847,
+            server_version: "0.1.0".to_string(),
+        });
 
         let json = serde_json::to_string(&msg).expect("serialization must succeed");
 
         assert!(json.contains(r#""type":"registered""#), "got: {json}");
         assert!(json.contains(r#""remote_port":32847"#), "got: {json}");
+    }
+
+    #[test]
+    fn registered_without_version_deserializes() {
+        // Older servers omit `server_version`; it must default to empty.
+        let json = r#"{"type":"registered","remote_port":32847}"#;
+
+        let msg: ServerMsg = serde_json::from_str(json).expect("deserialization must succeed");
+
+        match msg {
+            ServerMsg::Registered(r) => assert_eq!(r.server_version, ""),
+            other => panic!("expected Registered, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -207,6 +246,7 @@ mod tests {
             protocol: "http".to_string(),
             local_port: 3000,
             remote_port: Some(9000),
+            client_version: "0.1.0".to_string(),
         });
 
         let framed = encode(&original).expect("encode must succeed");

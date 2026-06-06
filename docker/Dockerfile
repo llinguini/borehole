@@ -29,6 +29,11 @@ WORKDIR /app
 # Copy the full workspace (see .dockerignore for what is excluded).
 COPY . .
 
+# Version reported by the binary. CI passes the release tag; defaults to empty
+# (build.rs then falls back to the crate version in Cargo.toml).
+ARG BOREHOLE_VERSION=""
+ENV BOREHOLE_VERSION=${BOREHOLE_VERSION}
+
 # Build only the server binary in release mode for the musl target.
 RUN cargo build --release --target x86_64-unknown-linux-musl -p server
 

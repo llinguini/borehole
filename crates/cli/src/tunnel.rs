@@ -40,12 +40,13 @@ pub async fn run(
     // 2. Open the control connection and complete the TLS handshake.
     let mut stream = tls_connect(&connector, &server_name, &cfg.server_addr).await?;
 
-    // 3. Send the registration request.
+    // 3. Send the registration request, advertising our version.
     let register = ClientMsg::Register(Register {
         token: cfg.token.clone(),
         protocol: protocol.to_string(),
         local_port,
         remote_port,
+        client_version: crate::VERSION.to_string(),
     });
     stream.write_all(encode(&register)?.as_bytes()).await?;
     stream.flush().await?;
@@ -58,13 +59,18 @@ pub async fn run(
         .await
         .context("failed to read server response")?;
 
-    let assigned_port = match decode(line.trim_end())? {
+    let (assigned_port, server_version) = match decode(line.trim_end())? {
         ServerMsg::Error(ServerError { reason }) => return Err(anyhow!(reason)),
-        ServerMsg::Registered(Registered { remote_port }) => remote_port,
+        ServerMsg::Registered(Registered {
+            remote_port,
+            server_version,
+        }) => (remote_port, server_version),
         other => bail!("unexpected response from server: {other:?}"),
     };
 
     print_banner(protocol, &server_ip, local_port, assigned_port);
+    warn_on_version_mismatch(&server_version);
+    spawn_update_check();
 
     // 5. Keep listening for server notifications and serve each new visitor.
     loop {
@@ -206,6 +212,39 @@ async fn serve_conn(
 
     copy_bidirectional(&mut server_stream, &mut local_stream).await?;
     Ok(())
+}
+
+/// Warns when the CLI and server report different versions. The protocol is
+/// backward compatible, so this is informational only (empty = unknown peer).
+fn warn_on_version_mismatch(server_version: &str) {
+    if !server_version.is_empty() && server_version != crate::VERSION {
+        eprintln!(
+            "{} CLI v{} and server v{} differ; consider updating both",
+            "⚠".yellow(),
+            crate::VERSION,
+            server_version
+        );
+    }
+}
+
+/// Spawns a best-effort, time-bounded check for a newer CLI release. Any
+/// failure (offline, rate-limited, parse error) is silently ignored so it never
+/// interferes with the tunnel.
+fn spawn_update_check() {
+    tokio::spawn(async {
+        let check = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tokio::task::spawn_blocking(crate::update::check_newer),
+        )
+        .await;
+
+        if let Ok(Ok(Ok(Some(latest)))) = check {
+            eprintln!(
+                "{} A new version v{latest} is available. Run `borehole update`.",
+                "↑".green()
+            );
+        }
+    });
 }
 
 /// Prints the success banner once the tunnel is established.

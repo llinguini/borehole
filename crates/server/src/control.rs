@@ -84,6 +84,14 @@ pub async fn handle_control(stream: TlsStream<TcpStream>, state: Arc<ServerState
 
     match msg {
         ClientMsg::Register(reg) => {
+            // Log the client version (empty for pre-versioning clients) so
+            // operators can spot outdated clients.
+            let client_version = if reg.client_version.is_empty() {
+                "unknown".to_string()
+            } else {
+                reg.client_version.clone()
+            };
+
             // (a) Reject unknown tokens.
             if !state.tokens.contains(&reg.token) {
                 let err = ServerMsg::Error(ServerError {
@@ -107,12 +115,19 @@ pub async fn handle_control(stream: TlsStream<TcpStream>, state: Arc<ServerState
                 }
             };
 
-            // (c) Confirm the registration to the client.
-            let registered = ServerMsg::Registered(Registered { remote_port });
+            // (c) Confirm the registration to the client, advertising our
+            // version so the CLI can warn on mismatches.
+            let registered = ServerMsg::Registered(Registered {
+                remote_port,
+                server_version: crate::VERSION.to_string(),
+            });
             if write_msg(&mut reader, &registered).await.is_err() {
                 state.port_mgr.lock().unwrap().release(remote_port);
                 return;
             }
+            eprintln!(
+                "tunnel registered on port {remote_port} (client v{client_version})"
+            );
 
             // (d) Open the public listener for external visitors.
             let listener = match TcpListener::bind(("0.0.0.0", remote_port)).await {

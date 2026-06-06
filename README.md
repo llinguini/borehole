@@ -156,6 +156,42 @@ borehole start tcp 8000 --remote-port 35000
 The CLI checks that something is actually listening on the local port before it
 opens the tunnel. On success it prints the public address to share.
 
+## Updating
+
+Check your installed version with `borehole --version`. On `borehole start` the
+CLI also warns when its version differs from the server's, and notifies you when
+a newer release is available.
+
+### CLI
+
+```bash
+borehole update
+```
+
+Downloads the latest matching binary from GitHub Releases and replaces the
+running executable in place (Linux, macOS and Windows). Pin a version with
+`BOREHOLE_VERSION=v0.1.2 borehole update`.
+
+### Server
+
+The server runs as an immutable Docker image, so it is updated by pulling the
+new image and recreating the container:
+
+```bash
+docker pull ghcr.io/llinguini/borehole-server:latest
+docker rm -f borehole-server
+docker run -d \
+  --name borehole-server \
+  --restart unless-stopped \
+  --network host \
+  -v /etc/borehole:/etc/borehole:ro \
+  ghcr.io/llinguini/borehole-server:latest
+```
+
+> Keep the server and CLI on the same version. The `Cargo.toml` version must
+> match the release tag; the pipeline injects the tag at build time so published
+> artifacts always report the right version.
+
 ## Configuration reference
 
 ### Server — `/etc/borehole/config.json`

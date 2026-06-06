@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-06-06
+
 ### Fixed
 
 - `borehole-server` TLS: load the full PEM certificate chain (leaf plus
@@ -16,6 +18,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Versioning and self-update support:
+  - The workspace now carries a real version (`0.1.0`); both binaries report it
+    via `--version` (`borehole`) / startup log (`borehole-server`). A `build.rs`
+    lets CI inject the release tag (`BOREHOLE_VERSION`) so artifacts match the
+    published Release/image, falling back to the crate version locally.
+  - The CLI and server exchange versions on `Register`/`Registered`
+    (`#[serde(default)]`, backward compatible). On `borehole start` the CLI
+    warns if its version differs from the server's and does a best-effort,
+    time-bounded check for a newer GitHub release.
+  - New `borehole update` command: downloads the matching prebuilt binary from
+    the latest Release and replaces the running executable in place (via `ureq`,
+    `semver` and `self-replace`). Honors `BOREHOLE_REPO` / `BOREHOLE_VERSION`.
+  - The release pipeline injects the tag version into the CLI build and the
+    server image (Docker `BOREHOLE_VERSION` build-arg).
 - `README.md`: end-to-end guide covering architecture, server deployment via
   Docker/GHCR, TLS certificate setup (Let's Encrypt), CLI installation and
   usage, configuration reference, building from source, the release pipeline

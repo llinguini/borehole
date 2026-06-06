@@ -1,15 +1,20 @@
 mod config;
 mod tunnel;
+mod update;
 
 use std::io::Write;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use owo_colors::OwoColorize;
 
+/// CLI version, resolved at build time (release tag in CI, crate version
+/// otherwise). See `build.rs`.
+pub const VERSION: &str = env!("BOREHOLE_VERSION");
+
 /// Top-level CLI: each variant is a subcommand of `borehole`.
 #[derive(Parser)]
-#[command(name = "borehole", about = "Self-hosted reverse tunnel")]
+#[command(name = "borehole", version = VERSION, about = "Self-hosted reverse tunnel")]
 enum Cli {
     /// Configure server address and token
     Config {
@@ -23,6 +28,8 @@ enum Cli {
         #[command(subcommand)]
         protocol: StartCmd,
     },
+    /// Update the borehole CLI to the latest release
+    Update,
 }
 
 /// Tunnel protocols supported by `borehole start`.
@@ -47,6 +54,13 @@ async fn main() -> Result<()> {
     match Cli::parse() {
         Cli::Config { server, token } => run_config(server, token).await,
         Cli::Start { protocol } => run_start(protocol).await,
+        Cli::Update => {
+            // The updater is blocking (ureq + file replacement), so run it off
+            // the async runtime.
+            tokio::task::spawn_blocking(update::run)
+                .await
+                .map_err(|e| anyhow!("update task failed: {e}"))?
+        }
     }
 }
 

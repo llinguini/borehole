@@ -80,6 +80,10 @@ jobs:
           key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build borehole CLI
+        # Inject the tag as the reported version so the binary matches the
+        # Release (consumed by build.rs -> BOREHOLE_VERSION).
+        env:
+          BOREHOLE_VERSION: ${{ github.ref_name }}
         run: >-
           cargo build --release --locked
           -p cli --target ${{ matrix.target }}
@@ -146,5 +150,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BOREHOLE_VERSION=${{ github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

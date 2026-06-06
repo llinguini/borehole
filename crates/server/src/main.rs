@@ -17,6 +17,10 @@ use control::{handle_control, ServerState};
 /// Default location of the server configuration file when none is given.
 const DEFAULT_CONFIG_PATH: &str = "/etc/borehole/config.json";
 
+/// Server version, resolved at build time (release tag in CI, crate version
+/// otherwise). See `build.rs`.
+pub const VERSION: &str = env!("BOREHOLE_VERSION");
+
 /// Server configuration, deserialized from a JSON file.
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -63,7 +67,10 @@ async fn main() {
         Ok(listener) => listener,
         Err(e) => fatal(&format!("cannot bind {}: {e}", config.bind_control)),
     };
-    eprintln!("borehole-server listening on {}", config.bind_control);
+    eprintln!(
+        "borehole-server v{VERSION} listening on {}",
+        config.bind_control
+    );
 
     // 6. Accept control connections, complete the TLS handshake on a dedicated
     //    task and dispatch each one to the control plane.
