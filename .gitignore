@@ -1,4 +1,6 @@
-
+# Rust build artifacts
+/target
+**/*.rs.bk
 
 # Cargo.lock is intentionally tracked: this workspace ships binaries.
 
@@ -17,5 +19,3 @@ config.json
 .DS_Store
 Thumbs.db
 
-CHANGELOG.md
-project-knowledge.md
