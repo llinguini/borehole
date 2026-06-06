@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `borehole-server` TLS: load the full PEM certificate chain (leaf plus
+  intermediates) instead of only the first block. Without the intermediates,
+  clients using public CAs (`webpki_roots`) failed the handshake with
+  `UnknownIssuer` even when `fullchain.pem` from Let's Encrypt was configured.
+
 ### Added
 
 - `.github/workflows/release.yml`: tag-triggered (`v*`) release pipeline.

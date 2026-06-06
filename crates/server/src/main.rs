@@ -100,13 +100,23 @@ fn load_config(path: &str) -> Config {
     }
 }
 
-/// Loads the certificate and key and assembles a `TlsAcceptor`, terminating the
-/// process on any failure.
+/// Loads the PEM certificate chain (leaf first, then intermediates) and the
+/// private key, then assembles a `TlsAcceptor`. Terminates the process on any
+/// failure.
 fn build_tls_acceptor(tls: &TlsConfig) -> TlsAcceptor {
-    let cert = match CertificateDer::from_pem_file(&tls.cert) {
-        Ok(cert) => cert,
-        Err(e) => fatal(&format!("cannot load cert {}: {e}", tls.cert)),
-    };
+    // `from_pem_file` only reads the first PEM block; Let's Encrypt's
+    // `fullchain.pem` contains the leaf plus intermediates and all of them must
+    // be sent during the handshake or clients report UnknownIssuer.
+    let certs: Vec<CertificateDer<'static>> =
+        match CertificateDer::pem_file_iter(&tls.cert) {
+            Ok(iter) => iter.collect::<Result<Vec<_>, _>>(),
+            Err(e) => Err(e),
+        }
+        .unwrap_or_else(|e| fatal(&format!("cannot load cert {}: {e}", tls.cert)));
+    if certs.is_empty() {
+        fatal(&format!("no certificates found in {}", tls.cert));
+    }
+
     let key = match PrivateKeyDer::from_pem_file(&tls.key) {
         Ok(key) => key,
         Err(e) => fatal(&format!("cannot load key {}: {e}", tls.key)),
@@ -114,7 +124,7 @@ fn build_tls_acceptor(tls: &TlsConfig) -> TlsAcceptor {
 
     let server_config = match ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(vec![cert], key)
+        .with_single_cert(certs, key)
     {
         Ok(server_config) => server_config,
         Err(e) => fatal(&format!("invalid TLS material: {e}")),

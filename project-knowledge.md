@@ -46,8 +46,12 @@ Workspace members (declared in root `Cargo.toml`):
   `ServerConfig` + `with_single_cert`, certs/keys via
   `pki_types::pem::PemObject::from_pem_file` — the `PemObject` trait MUST be
   imported), then accepts control connections, TLS-handshakes each on its own
-  task and calls `handle_control`. Config path is argv[1] or
+  task and calls `handle_control`.   Config path is argv[1] or
   `/etc/borehole/config.json`. Fatal errors -> `eprintln!` + `exit(1)`.
+  GOTCHA (fixed): `build_tls_acceptor` must use
+  `CertificateDer::pem_file_iter` + collect, NOT `from_pem_file` (first block
+  only). LE `fullchain.pem` has leaf + intermediate; serving only the leaf
+  makes rustls clients fail with `UnknownIssuer` / server logs `UnknownCA`.
   Modules:
   - `control`: TLS control plane + token validation. `ServerState` (shared,
     `Arc`-wrapped) holds `tokens: HashSet<String>`, `port_mgr:

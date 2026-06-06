@@ -1,0 +1,23 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Cargo.lock is intentionally tracked: this workspace ships binaries.
+
+# Local TLS material and runtime secrets (never commit these).
+# The committed sample stays via the explicit negation below.
+*.pem
+config.json
+!borehole.example.json
+
+# Editor / IDE
+.idea/
+*.swp
+*.swo
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+CHANGELOG.md
+project-knowledge.md
