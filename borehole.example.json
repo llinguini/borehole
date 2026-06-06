@@ -1,0 +1,10 @@
+{
+  "bind_control": "0.0.0.0:7000",
+  "bind_http": "0.0.0.0:80",
+  "port_range": [30000, 40000],
+  "tokens": ["cambia-este-token-por-uno-seguro"],
+  "tls": {
+    "cert": "/etc/borehole/cert.pem",
+    "key": "/etc/borehole/key.pem"
+  }
+}

@@ -1,0 +1,16 @@
+[package]
+name = "server"
+edition = "2021"
+
+[[bin]]
+name = "borehole-server"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+common = { path = "../common" }

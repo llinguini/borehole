@@ -1,0 +1,22 @@
+# Antes de levantar:
+# 1. Copia config.json a /etc/borehole/config.json en el VPS
+# 2. Coloca cert.pem y key.pem en /etc/borehole/
+# 3. docker compose up -d
+
+services:
+  borehole-server:
+    image: borehole-server
+    # Build context is the repo root so the Dockerfile can copy the whole
+    # workspace; the Dockerfile path is relative to that context.
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "7000:7000"
+      - "30000-40000:30000-40000"
+    volumes:
+      # Config and TLS certificates, mounted read-only.
+      - /etc/borehole:/etc/borehole:ro
+    environment:
+      - RUST_LOG=info
