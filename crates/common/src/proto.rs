@@ -29,6 +29,16 @@ pub struct DataConn {
     pub conn_id: String,
 }
 
+/// Sent by the client to check connectivity and validate its token without
+/// establishing a tunnel. The server answers with `Pong` on success or
+/// `Error` if the token is rejected. Unlike `Register`, this acquires no port
+/// and opens no public listener, so it is free of side effects.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Ping {
+    /// Authentication token to validate against the server's token set.
+    pub token: String,
+}
+
 /// Envelope for every message the client (CLI) sends to the server.
 ///
 /// Serialized as an internally-tagged enum: the `"type"` field selects the
@@ -38,6 +48,7 @@ pub struct DataConn {
 pub enum ClientMsg {
     Register(Register),
     DataConn(DataConn),
+    Ping(Ping),
 }
 
 /// Confirms a successful `Register` and reports the public port bound to the
@@ -72,6 +83,8 @@ pub struct ServerError {
 pub enum ServerMsg {
     Registered(Registered),
     NewConn(NewConn),
+    /// Successful reply to a `Ping`: connectivity and token are valid.
+    Pong,
     #[serde(rename = "error")]
     Error(ServerError),
 }
@@ -158,6 +171,33 @@ mod tests {
             ServerMsg::Error(ServerError { reason }) => assert_eq!(reason, "invalid token"),
             other => panic!("expected Error, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn ping_serializes_with_type_tag() {
+        let msg = ClientMsg::Ping(Ping {
+            token: "secret".to_string(),
+        });
+
+        let json = serde_json::to_string(&msg).expect("serialization must succeed");
+
+        assert!(json.contains(r#""type":"ping""#), "got: {json}");
+        assert!(json.contains(r#""token":"secret""#), "got: {json}");
+    }
+
+    #[test]
+    fn pong_serializes_as_bare_tag() {
+        let json = serde_json::to_string(&ServerMsg::Pong).expect("serialization must succeed");
+
+        assert_eq!(json, r#"{"type":"pong"}"#);
+    }
+
+    #[test]
+    fn pong_deserializes() {
+        let msg: ServerMsg =
+            serde_json::from_str(r#"{"type":"pong"}"#).expect("deserialization must succeed");
+
+        assert!(matches!(msg, ServerMsg::Pong));
     }
 
     #[test]

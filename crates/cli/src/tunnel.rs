@@ -11,7 +11,8 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
 use common::proto::{
-    decode, encode, ClientMsg, DataConn, NewConn, Register, Registered, ServerError, ServerMsg,
+    decode, encode, ClientMsg, DataConn, NewConn, Ping, Register, Registered, ServerError,
+    ServerMsg,
 };
 
 use crate::config::BoreholeConfig;
@@ -24,16 +25,15 @@ pub async fn run(
     local_port: u16,
     remote_port: Option<u16>,
 ) -> Result<()> {
+    // 0. Fail fast if there is nothing to expose: the local service must be
+    //    reachable before we register a tunnel for it.
+    ensure_local_service(local_port).await?;
+
     // 1. Build the client-side TLS configuration from the system roots.
     let connector = build_connector();
 
     // The server hostname is the part of `server_addr` before the port.
-    let server_ip = cfg
-        .server_addr
-        .split(':')
-        .next()
-        .unwrap_or(cfg.server_addr.as_str())
-        .to_string();
+    let server_ip = server_hostname(&cfg.server_addr);
     let server_name =
         ServerName::try_from(server_ip.clone()).context("invalid server hostname")?;
 
@@ -100,6 +100,63 @@ pub async fn run(
     Ok(())
 }
 
+/// Extracts the hostname from a `host:port` address, used as the TLS
+/// `ServerName`. Falls back to the whole string when no port is present.
+fn server_hostname(server_addr: &str) -> String {
+    server_addr
+        .split(':')
+        .next()
+        .unwrap_or(server_addr)
+        .to_string()
+}
+
+/// Ensures a local service is listening on `127.0.0.1:local_port`. Connecting
+/// is the most reliable cross-platform check: a free port refuses the
+/// connection, so a successful connect proves something is listening.
+async fn ensure_local_service(local_port: u16) -> Result<()> {
+    TcpStream::connect(("127.0.0.1", local_port))
+        .await
+        .map(|_| ())
+        .with_context(|| {
+            format!(
+                "no local service is listening on 127.0.0.1:{local_port}; \
+                 start it before opening the tunnel"
+            )
+        })
+}
+
+/// Validates connectivity, TLS and the configured token by performing a
+/// `Ping`/`Pong` round-trip against the server. Returns an error describing the
+/// first failure (connection, TLS handshake, or rejected token). Acquires no
+/// port on the server, so it is safe to call from `borehole config`.
+pub async fn check_server(cfg: &BoreholeConfig) -> Result<()> {
+    let connector = build_connector();
+    let server_ip = server_hostname(&cfg.server_addr);
+    let server_name =
+        ServerName::try_from(server_ip).context("invalid server hostname")?;
+
+    let mut stream = tls_connect(&connector, &server_name, &cfg.server_addr).await?;
+
+    let ping = ClientMsg::Ping(Ping {
+        token: cfg.token.clone(),
+    });
+    stream.write_all(encode(&ping)?.as_bytes()).await?;
+    stream.flush().await?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .await
+        .context("failed to read server response")?;
+
+    match decode(line.trim_end())? {
+        ServerMsg::Pong => Ok(()),
+        ServerMsg::Error(ServerError { reason }) => Err(anyhow!(reason)),
+        other => bail!("unexpected response from server: {other:?}"),
+    }
+}
+
 /// Builds a `TlsConnector` trusting the system's root certificates.
 fn build_connector() -> TlsConnector {
     let mut roots = RootCertStore::empty();
@@ -160,6 +217,5 @@ fn print_banner(protocol: &str, server_ip: &str, local_port: u16, remote_port: u
     println!("  local   → {}", local_url.cyan());
     println!("  remoto  → {}", remote_url.cyan());
     println!();
-    println!("  Para conectar: ssh -p {remote_port} user@{server_ip}");
     println!("  Ctrl+C para cerrar");
 }

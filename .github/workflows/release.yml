@@ -23,6 +23,10 @@ jobs:
   build-cli:
     name: Build CLI (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    # Each matrix job uploads its own binary to the Release, so it needs write
+    # access to repository contents.
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -89,12 +93,16 @@ jobs:
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" \
             "dist/${{ matrix.asset }}"
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      # Publish this target's binary to the Release as soon as it is built,
+      # instead of waiting for the whole matrix. The action is idempotent:
+      # whichever job runs first creates the Release, the rest just add their
+      # asset. This avoids a slow runner (e.g. macOS) blocking every upload.
+      - name: Publish binary to release
+        uses: softprops/action-gh-release@v2
         with:
-          name: ${{ matrix.asset }}
-          path: dist/${{ matrix.asset }}
-          if-no-files-found: error
+          files: dist/${{ matrix.asset }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
 
   # ---------------------------------------------------------------------------
   # Build and push the server image to ghcr.io. Uses the repository-scoped
@@ -140,26 +148,3 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-  # ---------------------------------------------------------------------------
-  # Collect the per-target CLI binaries and attach them to the GitHub Release.
-  # ---------------------------------------------------------------------------
-  release:
-    name: Publish GitHub Release
-    needs: build-cli
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download CLI artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: Create release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/borehole-*
-          generate_release_notes: true
-          fail_on_unmatched_files: true

@@ -166,5 +166,17 @@ pub async fn handle_control(stream: TlsStream<TcpStream>, state: Arc<ServerState
             }
             // Unknown id: drop the connection silently.
         }
+        ClientMsg::Ping(ping) => {
+            // Connectivity/token probe: validate the token and reply, without
+            // reserving a port or opening any public listener.
+            let reply = if state.tokens.contains(&ping.token) {
+                ServerMsg::Pong
+            } else {
+                ServerMsg::Error(ServerError {
+                    reason: "invalid token".into(),
+                })
+            };
+            let _ = write_msg(&mut reader, &reply).await;
+        }
     }
 }

@@ -16,14 +16,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `README.md`: end-to-end guide covering architecture, server deployment via
+  Docker/GHCR, TLS certificate setup (Let's Encrypt), CLI installation and
+  usage, configuration reference, building from source, the release pipeline
+  and a troubleshooting table.
+- Installer scripts so the CLI can be run as `borehole` (instead of
+  `./borehole-...`):
+  - `install.sh` (Linux/macOS): downloads the matching binary from GitHub
+    Releases and installs it to `/usr/local/bin` when possible (directly, as
+    root or via `sudo`), falling back to `~/.local/bin`. Honors
+    `BOREHOLE_REPO`, `BOREHOLE_VERSION` and `BOREHOLE_INSTALL_DIR`.
+  - `install.ps1` (Windows): downloads `borehole.exe` to
+    `%LOCALAPPDATA%\Programs\borehole` and adds it to the user PATH.
+- CLI pre-flight validations:
+  - `borehole start` now checks that a local service is listening on
+    `127.0.0.1:<local_port>` before registering the tunnel, failing fast with a
+    clear message otherwise.
+  - `borehole config` now verifies the saved configuration against the server
+    (TLS handshake + token) right after saving, reporting success or a
+    non-fatal warning.
+  - `borehole config` defaults `server_addr` to port `7000` when the user
+    types only a host (e.g. `example.com` -> `example.com:7000`).
+- Protocol `Ping`/`Pong` messages (`common::proto`): a side-effect-free
+  connectivity and token probe (no port reserved, no public listener opened).
+  The server validates the token and replies `Pong` or `Error`.
+
 - `.github/workflows/release.yml`: tag-triggered (`v*`) release pipeline.
   Builds the `borehole` CLI natively per target
   (`x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`,
   `aarch64-apple-darwin`, `x86_64-apple-darwin`,
-  `x86_64-pc-windows-msvc`) and attaches each binary directly to the
-  GitHub Release; builds and pushes the `borehole-server` Docker image to
-  `ghcr.io/<owner>/borehole-server` (GitHub Packages) using the
-  repository-scoped `GITHUB_TOKEN`.
+  `x86_64-pc-windows-msvc`). Each matrix job uploads its own binary to the
+  GitHub Release as soon as it finishes (no longer waiting for the whole
+  matrix, so a slow runner like macOS does not block the others); builds and
+  pushes the `borehole-server` Docker image to `ghcr.io/<owner>/borehole-server`
+  (GitHub Packages) using the repository-scoped `GITHUB_TOKEN`.
 
 - Initial Rust workspace `Cargo.toml` defining the `borehole` workspace with
   three members (`crates/common`, `crates/cli`, `crates/server`), shared

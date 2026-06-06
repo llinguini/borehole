@@ -5,6 +5,9 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+/// Control-plane port assumed when the user omits it in `server_addr`.
+pub const DEFAULT_SERVER_PORT: u16 = 7000;
+
 /// Persistent CLI configuration stored at `~/.borehole.json`.
 ///
 /// `Default` yields empty strings, which is the starting point for the
@@ -15,6 +18,21 @@ pub struct BoreholeConfig {
     pub server_addr: String,
     /// Authentication token presented to the server.
     pub token: String,
+}
+
+/// Ensures `addr` carries a port, appending `:DEFAULT_SERVER_PORT` when the
+/// user typed only a host. An address that already contains a port (or any
+/// `:`) is returned untouched.
+///
+/// NOTE: like the rest of the CLI, this does not handle bracketless IPv6
+/// literals; a bare IPv6 address would be misread as having a port.
+pub fn normalize_server_addr(addr: &str) -> String {
+    let addr = addr.trim();
+    if addr.is_empty() || addr.contains(':') {
+        addr.to_string()
+    } else {
+        format!("{addr}:{DEFAULT_SERVER_PORT}")
+    }
 }
 
 /// Returns the path to the configuration file: `~/.borehole.json`.
@@ -55,4 +73,28 @@ pub fn save(cfg: &BoreholeConfig) -> Result<()> {
     let path = config_path();
     let json = serde_json::to_string_pretty(cfg).context("failed to serialize config")?;
     std::fs::write(&path, json).with_context(|| format!("failed to write {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_appends_default_port_when_missing() {
+        assert_eq!(
+            normalize_server_addr("example.com"),
+            format!("example.com:{DEFAULT_SERVER_PORT}")
+        );
+    }
+
+    #[test]
+    fn normalize_keeps_explicit_port() {
+        assert_eq!(normalize_server_addr("example.com:9000"), "example.com:9000");
+    }
+
+    #[test]
+    fn normalize_trims_and_preserves_empty() {
+        assert_eq!(normalize_server_addr("  example.com  "), format!("example.com:{DEFAULT_SERVER_PORT}"));
+        assert_eq!(normalize_server_addr(""), "");
+    }
 }

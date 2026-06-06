@@ -28,6 +28,8 @@ Workspace members (declared in root `Cargo.toml`):
     `~/.borehole.json` (via `dirs::home_dir()` or `$HOME`, panics otherwise).
     `load() -> anyhow::Result<BoreholeConfig>` (friendly "No config found. Run
     `borehole config` first." on missing file). `save(&cfg)` writes pretty JSON.
+    `normalize_server_addr(addr)` appends `:DEFAULT_SERVER_PORT` (7000) when the
+    host has no `:` (no bracketless IPv6 support). Used by the `config` command.
   - `tunnel`: `run(cfg, protocol, local_port, remote_port)` builds a client
     `TlsConnector` (system roots via `webpki_roots::TLS_SERVER_ROOTS` +
     `RootCertStore::extend`), TLS-connects to `cfg.server_addr` (ServerName =
@@ -36,7 +38,10 @@ Workspace members (declared in root `Cargo.toml`):
     `NewConn` spawning `serve_conn` (fresh TLS conn + `DataConn` +
     `copy_bidirectional` to `127.0.0.1:{local_port}`). Any other message or read
     error ends the loop with `Ok(())`. NOTE: writes are explicitly `flush`ed
-    (TLS buffering).
+    (TLS buffering). `run` first calls `ensure_local_service(local_port)`
+    (TCP connect to `127.0.0.1:port`) and aborts if nothing is listening.
+    `check_server(cfg)` does a `Ping`/`Pong` round-trip (TLS + token) and is
+    used by `borehole config` (failure is reported as a non-fatal warning).
   Depends on `common` (path) plus `tokio`, `tokio-rustls`, `rustls`, `serde`,
   `serde_json`, `clap`, `owo-colors`, `anyhow`, `webpki-roots` (workspace) and
   `dirs` (direct, cli-only). No `uuid` dependency.
@@ -129,13 +134,38 @@ Workspace members (declared in root `Cargo.toml`):
   `borehole --version`, but the clap command has no `version` set yet, so that
   flag is unsupported until `#[command(version)]` is added.
 
+## Docs
+
+- `README.md`: user-facing guide (English). Covers architecture, server via
+  Docker/GHCR (`--network host` recommended), Let's Encrypt certs, CLI install
+  via `install.sh`/`install.ps1`, config reference, building, release flow and
+  troubleshooting. Keep in sync when behavior changes.
+
+## Installers
+
+- `install.sh` (POSIX sh, Linux/macOS) and `install.ps1` (Windows PowerShell)
+  at the repo root install the `borehole` CLI from GitHub Releases so it runs
+  as `borehole` (not `./borehole-...`). One-liners:
+  `curl -fsSL .../install.sh | sh` and `irm .../install.ps1 | iex`.
+  - Asset mapping: Linux x86_64 -> musl build; macOS -> per-arch darwin;
+    Windows x86_64 -> `.exe`. Linux aarch64 is NOT published yet (errors out).
+  - `install.sh` dir resolution: `BOREHOLE_INSTALL_DIR` override, else
+    `/usr/local/bin` (writable / root / sudo), else `~/.local/bin`. Overrides:
+    `BOREHOLE_REPO`, `BOREHOLE_VERSION`. Default repo `llinguini/borehole`.
+  - GOTCHA: `resolve_install_dir` echoes "dir wrapper" consumed via
+    `set -- $(...)`; the wrapper is `sudo` or empty (handled with `${2:-}`).
+
 ## CI/CD
 
 - `.github/workflows/release.yml`: triggers on `v*` tags only. Three jobs:
-  - `build-cli` (matrix, native builds, `fail-fast: false`): builds ONLY the
-    `cli` crate (`cargo build --release --locked -p cli --target <t>`) for 5
-    targets and uploads each binary as a per-target artifact named
-    `borehole-<target>` (`.exe` on Windows). Native (not cross) on purpose:
+  - `build-cli` (matrix, native builds, `fail-fast: false`, `contents: write`):
+    builds ONLY the `cli` crate (`cargo build --release --locked -p cli
+    --target <t>`) for 5 targets and each job uploads its OWN binary
+    (`borehole-<target>`, `.exe` on Windows) straight to the Release via
+    `softprops/action-gh-release` (idempotent: first job creates the Release,
+    rest add assets). No separate `release` job and no upload/download-artifact:
+    this stops a slow runner (macOS waiting for a worker) from blocking the
+    other uploads. Native (not cross) on purpose:
     `aws-lc-sys` (via `rustls 0.23`) needs cmake/perl, and NASM on Windows
     (installed via `ilammy/setup-nasm`). musl target installs `musl-tools`.
     GOTCHA: the ubuntu->musl build of `aws-lc-sys` is the most fragile leg; if
@@ -169,12 +199,17 @@ Workspace members (declared in root `Cargo.toml`):
     `"register"`.
   - `DataConn`: `conn_id: String` (UUID v4 echoed from server's `NewConn`). Tag:
     `"data_conn"`.
+  - `Ping`: `token`. Side-effect-free probe: server validates the token and
+    replies `Pong` or `Error`, WITHOUT acquiring a port or opening a listener.
+    Tag: `"ping"`. Used by `borehole config` to validate TLS + token.
 - `ServerMsg` (server -> client) is an internally-tagged enum
   (`#[serde(tag = "type", rename_all = "snake_case")]`):
   - `Registered`: `remote_port: u16` (port assigned to the tunnel). Tag:
     `"registered"`.
   - `NewConn`: `conn_id: String` (UUID v4 for the incoming connection). Tag:
     `"new_conn"`.
+  - `Pong`: unit variant, serializes as `{"type":"pong"}`. Success reply to a
+    `Ping` (connectivity + token valid).
   - `Error(ServerError)`: `reason: String`. Tag forced to `"error"` via
     `#[serde(rename = "error")]` on the variant (otherwise it would be
     `"server_error"`).

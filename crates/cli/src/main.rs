@@ -45,14 +45,15 @@ enum StartCmd {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse() {
-        Cli::Config { server, token } => run_config(server, token),
+        Cli::Config { server, token } => run_config(server, token).await,
         Cli::Start { protocol } => run_start(protocol).await,
     }
 }
 
 /// Handles `borehole config`: updates the saved configuration from flags, or
-/// runs an interactive wizard when no flag is provided.
-fn run_config(server: Option<String>, token: Option<String>) -> Result<()> {
+/// runs an interactive wizard when no flag is provided. After saving, it probes
+/// the server (TLS + token) so misconfigurations surface immediately.
+async fn run_config(server: Option<String>, token: Option<String>) -> Result<()> {
     // With no flags, fall back to an interactive wizard.
     let (server, token) = if server.is_none() && token.is_none() {
         let server = prompt("Server address (host:port): ")?;
@@ -66,7 +67,8 @@ fn run_config(server: Option<String>, token: Option<String>) -> Result<()> {
     // that were provided.
     let mut cfg = config::load().unwrap_or_default();
     if let Some(server) = server {
-        cfg.server_addr = server;
+        // Default to the standard control port when the user omits it.
+        cfg.server_addr = config::normalize_server_addr(&server);
     }
     if let Some(token) = token {
         cfg.token = token;
@@ -74,6 +76,15 @@ fn run_config(server: Option<String>, token: Option<String>) -> Result<()> {
 
     config::save(&cfg)?;
     println!("{} Config saved", "✓".green());
+
+    // Verify the connection (TLS + token). A failure is reported but not fatal:
+    // the user may legitimately configure the CLI while the server is down.
+    print!("Validando conexión con el servidor... ");
+    std::io::stdout().flush()?;
+    match tunnel::check_server(&cfg).await {
+        Ok(()) => println!("{}", "✓".green()),
+        Err(e) => println!("{} {e}", "⚠".yellow()),
+    }
     Ok(())
 }
 
