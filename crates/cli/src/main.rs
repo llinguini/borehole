@@ -3,6 +3,7 @@ mod tunnel;
 mod update;
 
 use std::io::Write;
+use std::process::ExitCode;
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
@@ -50,13 +51,26 @@ enum StartCmd {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
     // rustls 0.23 needs an explicit default when multiple crypto backends could
     // be linked; we standardise on aws-lc-rs (same as tokio-rustls / ureq).
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("failed to install rustls crypto provider");
 
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            report_error(&e);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Dispatches the parsed command. Kept separate from `main` so errors can be
+/// formatted consistently in one place instead of relying on the default
+/// `Debug` rendering (which dumps the whole `Caused by:` chain).
+async fn run() -> Result<()> {
     match Cli::parse() {
         Cli::Config { server, token } => run_config(server, token).await,
         Cli::Start { protocol } => run_start(protocol).await,
@@ -66,6 +80,20 @@ async fn main() -> Result<()> {
             tokio::task::spawn_blocking(update::run)
                 .await
                 .map_err(|e| anyhow!("update task failed: {e}"))?
+        }
+    }
+}
+
+/// Prints a user-facing error: a single clean line with the top-level message.
+/// The underlying cause chain is only shown when `BOREHOLE_DEBUG` is set, so
+/// everyday failures stay readable instead of leaking technical noise like
+/// "Connection refused (os error 111)".
+fn report_error(err: &anyhow::Error) {
+    eprintln!("{} {err}", "✗".red().bold());
+
+    if std::env::var_os("BOREHOLE_DEBUG").is_some() {
+        for cause in err.chain().skip(1) {
+            eprintln!("  {} {cause}", "↳".dimmed());
         }
     }
 }

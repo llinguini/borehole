@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- CLI error output is now a single clean line (red `✗ <message>`) instead of
+  `anyhow`'s default `Error: ... Caused by: ...` dump. Set `BOREHOLE_DEBUG` to
+  also print the underlying cause chain for troubleshooting.
+
 ### Fixed
 
 - CLI panic on `borehole config` / `borehole update` (`CryptoProvider` / `ring` vs

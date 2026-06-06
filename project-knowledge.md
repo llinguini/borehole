@@ -92,6 +92,15 @@ Workspace members (declared in root `Cargo.toml`):
   Depends on `common` (path) plus `tokio`, `tokio-rustls`, `rustls`, `serde`,
   `serde_json`, `uuid` (workspace).
 
+## CLI error handling
+
+- `main` returns `ExitCode` (not `Result`): it calls `run()` and routes errors
+  through `report_error`, which prints `✗ <Display>` (top-level message only) in
+  red. The full `anyhow` cause chain is printed (indented `↳`) ONLY when
+  `BOREHOLE_DEBUG` is set. This avoids leaking noise like "Connection refused
+  (os error 111)" for expected failures. Keep user-facing messages in the
+  outermost `.context(...)`/`anyhow!` so Display shows the friendly text.
+
 ## Versioning & self-update
 
 - Single source of truth: `[workspace.package] version` in the root
