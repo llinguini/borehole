@@ -37,21 +37,21 @@ detect_asset() {
     case "$arch" in
         x86_64 | amd64) arch="x86_64" ;;
         aarch64 | arm64) arch="aarch64" ;;
-        *) err "unsupported architecture: $arch" ;;
+        *) err "arquitectura no soportada: $arch" ;;
     esac
 
     case "$os" in
         Linux)
             # Only x86_64 Linux is published today (static musl build).
             [ "$arch" = "x86_64" ] \
-                || err "no Linux $arch binary is published yet; build from source"
+                || err "aún no se publica binario de Linux $arch; compila desde el código"
             echo "borehole-x86_64-unknown-linux-musl"
             ;;
         Darwin)
             echo "borehole-${arch}-apple-darwin"
             ;;
         *)
-            err "unsupported OS: $os (use install.ps1 on Windows)"
+            err "SO no soportado: $os (usa install.ps1 en Windows)"
             ;;
     esac
 }
@@ -75,7 +75,7 @@ download() {
     elif command -v wget >/dev/null 2>&1; then
         wget -O "$out" "$url"
     else
-        err "neither curl nor wget is available"
+        err "no se encontró curl ni wget"
     fi
 }
 
@@ -110,7 +110,7 @@ main() {
     # Clean up the temp file on any exit.
     trap 'rm -f "$tmp"' EXIT INT TERM
 
-    info "Downloading $asset ($VERSION)..."
+    info "Descargando $asset ($VERSION)..."
     download "$url" "$tmp"
     chmod +x "$tmp"
 
@@ -119,25 +119,25 @@ main() {
     sudo_cmd="${2:-}"
     dest="${dir}/${BIN_NAME}"
 
-    info "Installing to $dest"
+    info "Instalando en $dest"
     $sudo_cmd mkdir -p "$dir"
     $sudo_cmd cp "$tmp" "$dest"
     $sudo_cmd chmod +x "$dest"
 
-    info "✓ Installed borehole to $dest"
+    info "✓ borehole instalado en $dest"
 
     # Warn if the install directory is not on PATH.
     case ":${PATH}:" in
         *":${dir}:"*) ;;
         *)
             info ""
-            info "⚠ $dir is not on your PATH. Add this to your shell profile:"
+            info "⚠ $dir no está en tu PATH. Añádelo a tu perfil de shell:"
             info "    export PATH=\"$dir:\$PATH\""
             ;;
     esac
 
     info ""
-    info "Run 'borehole config' to get started."
+    info "Ejecuta: borehole config"
 }
 
 main

@@ -1,0 +1,468 @@
+// Control plane: accepts TLS connections, validates tokens
+
+use std::collections::{HashMap, HashSet};
+use std::ops::RangeInclusive;
+use std::sync::{Arc, Mutex};
+
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
+
+use tokio_rustls::server::TlsStream;
+
+use common::proto::{decode, encode, ClientMsg, NewConn, Registered, ServerError, ServerMsg};
+use uuid::Uuid;
+
+use crate::port_mgr::PortManager;
+use crate::proxy;
+
+/// Shared, reference-counted server state passed to every connection handler.
+///
+/// Wrapped in an `Arc` so it can be cheaply cloned across async tasks. The
+/// interior `Mutex`es guard the mutable pieces of state.
+pub struct ServerState {
+    /// Set of valid authentication tokens loaded from configuration.
+    tokens: HashSet<String>,
+    /// Pool of public ports available for tunnels.
+    port_mgr: Mutex<PortManager>,
+    /// Map of `conn_id` -> oneshot channel used to hand the freshly accepted
+    /// data socket to the control handler that is waiting for it.
+    pending_conns: Mutex<HashMap<String, oneshot::Sender<TlsStream<TcpStream>>>>,
+}
+
+impl ServerState {
+    /// Builds the shared state from the configured tokens and port range,
+    /// returning it wrapped in an `Arc` ready to share across tasks.
+    pub fn new(tokens: Vec<String>, port_range: RangeInclusive<u16>) -> Arc<Self> {
+        Arc::new(Self {
+            tokens: tokens.into_iter().collect(),
+            port_mgr: Mutex::new(PortManager::new(port_range)),
+            pending_conns: Mutex::new(HashMap::new()),
+        })
+    }
+}
+
+/// Encodes a server message and writes the resulting newline-delimited frame
+/// to `writer`. Serialization failures are surfaced as I/O errors so callers
+/// can treat the whole send as a single fallible operation.
+async fn write_msg<W>(writer: &mut W, msg: &ServerMsg) -> std::io::Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let frame = encode(msg).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    writer.write_all(frame.as_bytes()).await
+}
+
+/// Handles a single incoming control connection.
+///
+/// Reads exactly one framed `ClientMsg` and then either:
+/// - `Register`: authenticates, reserves a public port, and serves visitor
+///   connections by announcing each one and waiting for the client to open a
+///   matching data connection; or
+/// - `DataConn`: hands the raw socket to the control handler waiting for that
+///   `conn_id`.
+pub async fn handle_control(stream: TlsStream<TcpStream>, state: Arc<ServerState>) {
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+
+    match reader.read_line(&mut line).await {
+        Ok(0) => return, // peer closed before sending anything
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("control read error: {e}");
+            return;
+        }
+    }
+
+    let msg: ClientMsg = match decode(line.trim_end()) {
+        Ok(msg) => msg,
+        Err(e) => {
+            eprintln!("control decode error: {e}");
+            return;
+        }
+    };
+
+    match msg {
+        ClientMsg::Register(reg) => {
+            // Log the client version (empty for pre-versioning clients) so
+            // operators can spot outdated clients.
+            let client_version = if reg.client_version.is_empty() {
+                "unknown".to_string()
+            } else {
+                reg.client_version.clone()
+            };
+
+            // (a) Reject unknown tokens.
+            if !state.tokens.contains(&reg.token) {
+                let err = ServerMsg::Error(ServerError {
+                    reason: "invalid token".into(),
+                });
+                let _ = write_msg(&mut reader, &err).await;
+                return;
+            }
+
+            // (b) Reserve a public port (specific or server-chosen). The lock
+            // is released immediately so it is never held across an await.
+            let remote_port = state.port_mgr.lock().unwrap().acquire(reg.remote_port);
+            let remote_port = match remote_port {
+                Some(port) => port,
+                None => {
+                    let err = ServerMsg::Error(ServerError {
+                        reason: "no ports available".into(),
+                    });
+                    let _ = write_msg(&mut reader, &err).await;
+                    return;
+                }
+            };
+
+            // (c) Confirm the registration to the client, advertising our
+            // version so the CLI can warn on mismatches.
+            let registered = ServerMsg::Registered(Registered {
+                remote_port,
+                server_version: crate::VERSION.to_string(),
+            });
+            if write_msg(&mut reader, &registered).await.is_err() {
+                state.port_mgr.lock().unwrap().release(remote_port);
+                return;
+            }
+            eprintln!(
+                "tunnel registered on port {remote_port} (client v{client_version})"
+            );
+
+            // (d) Open the public listener for external visitors.
+            let listener = match TcpListener::bind(("0.0.0.0", remote_port)).await {
+                Ok(listener) => listener,
+                Err(e) => {
+                    eprintln!("failed to bind port {remote_port}: {e}");
+                    state.port_mgr.lock().unwrap().release(remote_port);
+                    return;
+                }
+            };
+
+            // (e) For each visitor, announce a new connection and wait for the
+            // client to open the matching data connection.
+            loop {
+                let (visitor, _addr) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        eprintln!("accept error on port {remote_port}: {e}");
+                        break;
+                    }
+                };
+
+                let conn_id = Uuid::new_v4().to_string();
+                let notice = ServerMsg::NewConn(NewConn {
+                    conn_id: conn_id.clone(),
+                });
+                if write_msg(&mut reader, &notice).await.is_err() {
+                    break;
+                }
+
+                let (tx, rx) = oneshot::channel::<TlsStream<TcpStream>>();
+                state.pending_conns.lock().unwrap().insert(conn_id, tx);
+
+                // Wait for the data socket off the control path and splice it
+                // to the visitor connection.
+                tokio::spawn(async move {
+                    if let Ok(data) = rx.await {
+                        proxy::pipe(visitor, data).await;
+                    }
+                });
+            }
+
+            // Control connection gone: return the port to the pool.
+            state.port_mgr.lock().unwrap().release(remote_port);
+        }
+        ClientMsg::DataConn(dc) => {
+            // Deliver the raw socket to the handler waiting on this id.
+            let waiter = state.pending_conns.lock().unwrap().remove(&dc.conn_id);
+            if let Some(tx) = waiter {
+                let _ = tx.send(reader.into_inner());
+            }
+            // Unknown id: drop the connection silently.
+        }
+        ClientMsg::Ping(ping) => {
+            // Connectivity/token probe: validate the token and reply, without
+            // reserving a port or opening any public listener.
+            let reply = if state.tokens.contains(&ping.token) {
+                ServerMsg::Pong
+            } else {
+                ServerMsg::Error(ServerError {
+                    reason: "invalid token".into(),
+                })
+            };
+            let _ = write_msg(&mut reader, &reply).await;
+        }
+    }
+}
+mod control;
+mod port_mgr;
+mod proxy;
+
+use std::fs;
+use std::sync::Arc;
+
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::ServerConfig;
+use serde::Deserialize;
+use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
+
+use control::{handle_control, ServerState};
+
+/// Default location of the server configuration file when none is given.
+const DEFAULT_CONFIG_PATH: &str = "/etc/borehole/config.json";
+
+/// Server version, resolved at build time (release tag in CI, crate version
+/// otherwise). See `build.rs`.
+pub const VERSION: &str = env!("BOREHOLE_VERSION");
+
+/// Server configuration, deserialized from a JSON file.
+#[derive(Debug, Deserialize)]
+struct Config {
+    /// Address the control plane listens on, e.g. "0.0.0.0:7000".
+    bind_control: String,
+    /// Inclusive public port range `[start, end]` available for tunnels.
+    port_range: [u16; 2],
+    /// Valid authentication tokens.
+    tokens: Vec<String>,
+    /// TLS certificate and key material.
+    tls: TlsConfig,
+}
+
+/// Paths to the TLS certificate chain and private key (PEM-encoded).
+#[derive(Debug, Deserialize)]
+struct TlsConfig {
+    /// Path to the PEM-encoded certificate chain.
+    cert: String,
+    /// Path to the PEM-encoded private key.
+    key: String,
+}
+
+#[tokio::main]
+async fn main() {
+    // 1. Resolve the config path from argv[1], falling back to the default.
+    let config_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| DEFAULT_CONFIG_PATH.to_string());
+
+    // 2. Read and parse the configuration file.
+    let config = load_config(&config_path);
+
+    // 3. Build the TLS acceptor from the configured certificate and key.
+    let tls_acceptor = build_tls_acceptor(&config.tls);
+
+    // 4. Build the shared server state.
+    let state = ServerState::new(
+        config.tokens,
+        config.port_range[0]..=config.port_range[1],
+    );
+
+    // 5. Bind the control listener.
+    let listener = match TcpListener::bind(&config.bind_control).await {
+        Ok(listener) => listener,
+        Err(e) => fatal(&format!("cannot bind {}: {e}", config.bind_control)),
+    };
+    eprintln!(
+        "borehole-server v{VERSION} listening on {}",
+        config.bind_control
+    );
+
+    // 6. Accept control connections, complete the TLS handshake on a dedicated
+    //    task and dispatch each one to the control plane.
+    loop {
+        let (stream, _addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("accept error: {e}");
+                continue;
+            }
+        };
+
+        let acceptor = tls_acceptor.clone();
+        let state = state.clone();
+        tokio::spawn(async move {
+            match acceptor.accept(stream).await {
+                Ok(tls_stream) => handle_control(tls_stream, state).await,
+                Err(e) => eprintln!("TLS handshake error: {e}"),
+            }
+        });
+    }
+}
+
+/// Reads and deserializes the configuration file, terminating the process on
+/// any failure.
+fn load_config(path: &str) -> Config {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(e) => fatal(&format!("cannot read config {path}: {e}")),
+    };
+    match serde_json::from_str(&contents) {
+        Ok(config) => config,
+        Err(e) => fatal(&format!("invalid config {path}: {e}")),
+    }
+}
+
+/// Loads the PEM certificate chain (leaf first, then intermediates) and the
+/// private key, then assembles a `TlsAcceptor`. Terminates the process on any
+/// failure.
+fn build_tls_acceptor(tls: &TlsConfig) -> TlsAcceptor {
+    // `from_pem_file` only reads the first PEM block; Let's Encrypt's
+    // `fullchain.pem` contains the leaf plus intermediates and all of them must
+    // be sent during the handshake or clients report UnknownIssuer.
+    let certs: Vec<CertificateDer<'static>> =
+        match CertificateDer::pem_file_iter(&tls.cert) {
+            Ok(iter) => iter.collect::<Result<Vec<_>, _>>(),
+            Err(e) => Err(e),
+        }
+        .unwrap_or_else(|e| fatal(&format!("cannot load cert {}: {e}", tls.cert)));
+    if certs.is_empty() {
+        fatal(&format!("no certificates found in {}", tls.cert));
+    }
+
+    let key = match PrivateKeyDer::from_pem_file(&tls.key) {
+        Ok(key) => key,
+        Err(e) => fatal(&format!("cannot load key {}: {e}", tls.key)),
+    };
+
+    let server_config = match ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+    {
+        Ok(server_config) => server_config,
+        Err(e) => fatal(&format!("invalid TLS material: {e}")),
+    };
+
+    TlsAcceptor::from(Arc::new(server_config))
+}
+
+/// Logs a fatal error to stderr and terminates the process with status 1.
+fn fatal(msg: &str) -> ! {
+    eprintln!("{msg}");
+    std::process::exit(1);
+}
+// Port pool manager
+//
+// Tracks which TCP ports are free and which are handed out to active tunnels.
+// This type is intentionally `std`-only and not thread-safe; the caller is
+// expected to wrap it in a `Mutex` when shared across async tasks.
+
+use std::collections::{BTreeSet, HashSet};
+use std::ops::RangeInclusive;
+
+/// Manages a finite pool of TCP ports, allowing callers to reserve a specific
+/// or arbitrary free port and release it back when the tunnel closes.
+pub struct PortManager {
+    /// Ports currently free, ordered so the lowest can be picked cheaply.
+    available: BTreeSet<u16>,
+    /// Ports currently reserved by a tunnel.
+    in_use: HashSet<u16>,
+}
+
+impl PortManager {
+    /// Builds a manager whose available pool contains every port in `range`.
+    pub fn new(range: RangeInclusive<u16>) -> Self {
+        Self {
+            available: range.collect(),
+            in_use: HashSet::new(),
+        }
+    }
+
+    /// Reserves a port and moves it from `available` to `in_use`.
+    ///
+    /// - `Some(p)`: tries to reserve exactly `p`; returns `Some(p)` if it was
+    ///   free, `None` if it was taken (or outside the pool).
+    /// - `None`: reserves and returns the lowest available port, or `None` if
+    ///   the pool is exhausted.
+    pub fn acquire(&mut self, requested: Option<u16>) -> Option<u16> {
+        let port = match requested {
+            Some(p) => {
+                if self.available.remove(&p) {
+                    p
+                } else {
+                    return None;
+                }
+            }
+            None => {
+                let p = *self.available.iter().next()?;
+                self.available.remove(&p);
+                p
+            }
+        };
+
+        self.in_use.insert(port);
+        Some(port)
+    }
+
+    /// Returns `port` to the available pool. No-op if it was not in use.
+    pub fn release(&mut self, port: u16) {
+        if self.in_use.remove(&port) {
+            self.available.insert(port);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acquire_random_returns_lowest_port() {
+        let mut mgr = PortManager::new(30000..=30002);
+
+        assert_eq!(mgr.acquire(None), Some(30000));
+    }
+
+    #[test]
+    fn acquire_specific_reserves_exact_port() {
+        let mut mgr = PortManager::new(30000..=30002);
+
+        assert_eq!(mgr.acquire(Some(30001)), Some(30001));
+    }
+
+    #[test]
+    fn acquire_busy_port_returns_none() {
+        let mut mgr = PortManager::new(30000..=30002);
+
+        assert_eq!(mgr.acquire(Some(30001)), Some(30001));
+        assert_eq!(mgr.acquire(Some(30001)), None);
+    }
+
+    #[test]
+    fn release_returns_port_to_pool() {
+        let mut mgr = PortManager::new(30000..=30002);
+
+        let port = mgr.acquire(Some(30000)).expect("port must be free");
+        assert_eq!(mgr.acquire(Some(30000)), None);
+
+        mgr.release(port);
+        assert_eq!(mgr.acquire(Some(30000)), Some(30000));
+    }
+}
+// Bidirectional TCP proxy
+//
+// Splices two streams together, forwarding bytes in both directions until
+// either side closes. Used to glue an external (plain TCP) visitor connection
+// to the client's (TLS) data connection, so the two endpoints may differ in
+// type; hence the generic parameters.
+
+use tokio::io::{copy_bidirectional, AsyncRead, AsyncWrite};
+
+/// Pipes all traffic between `a` and `b` until one side closes, then logs the
+/// outcome. Errors are reported but not propagated, since each tunnel runs as
+/// an independent task.
+pub async fn pipe<A, B>(mut a: A, mut b: B)
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    match copy_bidirectional(&mut a, &mut b).await {
+        Ok((a_to_b, b_to_a)) => {
+            eprintln!("proxy closed: {a_to_b} bytes a->b, {b_to_a} bytes b->a");
+        }
+        Err(e) => {
+            eprintln!("proxy error: {e}");
+        }
+    }
+}

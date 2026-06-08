@@ -1,263 +1,204 @@
 # borehole
 
-Self-hosted reverse tunnel (an ngrok-like tool you fully control). Expose a
-local TCP service to the public internet through a server you run on a VPS, over
-an authenticated TLS control channel.
+Self-hosted TCP/HTTP reverse tunnel. An open-source alternative to ngrok: expose
+a local port to the public internet through a server you run yourself, over an
+authenticated TLS control channel.
 
-```
-visitor ──► server:public_port ──TLS──► borehole CLI ──► 127.0.0.1:local_port
-```
+## Quick start (30 seconds)
 
-## Contents
+```sh
+# 1. Install the client (Linux/macOS)
+curl -fsSL https://raw.githubusercontent.com/llinguini/borehole/main/scripts/install.sh | sh
 
-- [How it works](#how-it-works)
-- [Quick start](#quick-start)
-  - [1. Server (Docker)](#1-server-docker)
-  - [2. TLS certificates](#2-tls-certificates)
-  - [3. Client (CLI)](#3-client-cli)
-- [Configuration reference](#configuration-reference)
-- [Building from source](#building-from-source)
-- [Releases & CI](#releases--ci)
-- [Troubleshooting](#troubleshooting)
-- [License](#license)
+# 2. Point it at your server and authenticate
+borehole config --server your-vps:7000 --token your-token
 
-## How it works
+# 3. Expose local port 22 (SSH)
+borehole start tcp 22
+# ✓ Túnel activo
+#   local  → localhost:22
+#   remoto → your-vps:32847
 
-The project is a Cargo workspace with three crates:
-
-- **`common`** — the wire protocol (newline-delimited JSON over TLS).
-- **`server`** (`borehole-server`) — runs on your VPS. Validates tokens, assigns
-  public ports and proxies visitor traffic to the connected client.
-- **`cli`** (`borehole`) — runs on your machine. Registers a tunnel and forwards
-  incoming connections to a local port.
-
-When a visitor hits the public port, the server tells the client over the
-control connection; the client opens a fresh TLS data connection and the two
-streams are spliced together.
-
-## Quick start
-
-You need two things: the **server** running on a public host (with a TLS
-certificate), and the **CLI** on the machine whose service you want to expose.
-
-### 1. Server (Docker)
-
-The server is distributed **only** as a Docker image, published to the GitHub
-Container Registry:
-
-```
-ghcr.io/llinguini/borehole-server:latest
+# 4. Connect through the assigned remote port
+ssh -p 32847 user@your-vps
 ```
 
-On your VPS, prepare the config directory (see
-[Configuration reference](#configuration-reference) and
-[TLS certificates](#2-tls-certificates)):
+The remote port is assigned from the server's pool. Use `--remote-port` to ask
+for a fixed one.
 
-```bash
-sudo mkdir -p /etc/borehole
-# Put config.json, cert.pem and key.pem in /etc/borehole/
+## Installation
+
+### Client (`borehole`)
+
+**Linux / macOS** — installs to `/usr/local/bin` (falls back to `sudo` or
+`~/.local/bin`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/llinguini/borehole/main/scripts/install.sh | sh
 ```
 
-Then run it. On a Linux VPS, prefer host networking:
-
-```bash
-docker run -d \
-  --name borehole-server \
-  --restart unless-stopped \
-  --network host \
-  -v /etc/borehole:/etc/borehole:ro \
-  ghcr.io/llinguini/borehole-server:latest
-```
-
-> **Why `--network host`?** Publishing the full `30000-40000` range with `-p`
-> spawns ~10,000 `docker-proxy` processes (one per port), which is slow and can
-> exhaust memory (OOM). Host networking avoids that. If you shrink `port_range`
-> in `config.json` to something small, you can instead use
-> `-p 7000:7000 -p 30000-30100:30000-30100`.
-
-If the package is **private** (the default on first push), authenticate first:
-
-```bash
-echo <GITHUB_TOKEN_WITH_read:packages> | docker login ghcr.io -u <user> --password-stdin
-```
-
-#### Or with Docker Compose
-
-A [`docker/docker-compose.yml`](docker/docker-compose.yml) is provided (it builds
-from source). After placing the files in `/etc/borehole`:
-
-```bash
-docker compose -f docker/docker-compose.yml up -d
-```
-
-### 2. TLS certificates
-
-The CLI verifies the server certificate against the system root CAs, so a
-**self-signed certificate will be rejected**. Use a certificate from a public CA
-(e.g. Let's Encrypt), which requires a domain pointing at your VPS.
-
-```bash
-# DNS A record: tunnel.example.com -> <VPS IP>
-sudo systemctl stop nginx 2>/dev/null   # free port 80 if needed
-sudo certbot certonly --standalone -d tunnel.example.com
-
-sudo cp /etc/letsencrypt/live/tunnel.example.com/fullchain.pem /etc/borehole/cert.pem
-sudo cp /etc/letsencrypt/live/tunnel.example.com/privkey.pem  /etc/borehole/key.pem
-docker restart borehole-server
-```
-
-> Use **`fullchain.pem`** (leaf + intermediates), not Let's Encrypt's bare
-> `cert.pem`, or clients fail the handshake with `UnknownIssuer`.
->
-> Certificates expire after 90 days. After `certbot renew`, copy the files again
-> and restart the container (or mount the letsencrypt live directory directly).
-
-### 3. Client (CLI)
-
-#### Install
-
-Linux / macOS:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/llinguini/borehole/main/install.sh | sh
-```
-
-Windows (PowerShell):
+**Windows** — installs to `%LOCALAPPDATA%\borehole` and adds it to your PATH:
 
 ```powershell
-irm https://raw.githubusercontent.com/llinguini/borehole/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/llinguini/borehole/main/scripts/install.ps1 | iex
 ```
 
-The installer downloads the right binary from the latest GitHub Release and puts
-`borehole` on your PATH. Overrides: `BOREHOLE_VERSION`, `BOREHOLE_INSTALL_DIR`,
-`BOREHOLE_REPO`.
+**From source** (requires Rust ≥ 1.85):
 
-#### Configure
+```sh
+cargo install --path crates/cli
+```
 
-```bash
+### Server (`borehole-server`)
+
+The server runs on a host with a public IP. It needs a config file and a TLS
+certificate/key pair.
+
+#### Docker (recommended)
+
+```sh
+# From the repo root, prepare the mounted files:
+mkdir -p docker/config docker/certs
+
+# 1. Generate a self-signed TLS certificate (see below)
+openssl req -x509 -newkey rsa:4096 -nodes \
+  -keyout docker/certs/key.pem -out docker/certs/cert.pem \
+  -days 365 -subj "/CN=your-vps"
+
+# 2. Write docker/config/config.json (see the minimal config below)
+
+# 3. Build and run
+docker compose -f docker/docker-compose.yml up --build -d
+```
+
+The compose file publishes `7000` (control TLS), `7001` (data connections) and
+the tunnel range `30000-40000`, and mounts `docker/config` and `docker/certs`
+into the container.
+
+#### Direct binary
+
+```sh
+cargo install --path crates/server
+borehole-server --config /etc/borehole/config.json
+```
+
+#### Minimal `/etc/borehole/config.json`
+
+```json
+{
+  "bind_control": "0.0.0.0:7000",
+  "bind_http": "0.0.0.0:8080",
+  "port_range": [30000, 40000],
+  "tokens": ["your-token"],
+  "tls": {
+    "cert": "certs/cert.pem",
+    "key": "certs/key.pem"
+  }
+}
+```
+
+- `bind_control` — control plane (TLS). The data plane listens on the next port
+  (`7001` here), so open both plus the `port_range` on your firewall.
+- `tokens` — accepted client tokens; a client must present one to register.
+- `tls.cert` / `tls.key` — PEM paths, relative to the working directory (under
+  Docker that is `/etc/borehole`).
+
+#### Generate a TLS certificate
+
+A self-signed certificate is enough — the client does not verify the chain in
+v1 (see [Roadmap](#roadmap)):
+
+```sh
+openssl req -x509 -newkey rsa:4096 -nodes \
+  -keyout certs/key.pem -out certs/cert.pem \
+  -days 365 -subj "/CN=your-vps"
+```
+
+## Usage
+
+### `borehole config`
+
+Stores the server address and token in `~/.borehole.json`.
+
+```sh
+# Non-interactive
+borehole config --server your-vps:7000 --token your-token
+
+# Interactive wizard (prompts for both)
 borehole config
-# Server address (host:port): tunnel.example.com:7000   (port defaults to 7000)
-# Token: <one of the server's tokens>
 ```
 
-After saving, the CLI validates the connection (TLS + token) and reports `✓` or
-a warning. Settings are stored at `~/.borehole.json`.
+### `borehole start tcp <port> [--remote-port <port>]`
 
-#### Expose a port
+Exposes a local TCP port. The server assigns a random public port unless
+`--remote-port` is given.
 
-```bash
-# Forward a local service on 127.0.0.1:8000 to a public port on the server
-borehole start tcp 8000
-
-# Request a specific public port
-borehole start tcp 8000 --remote-port 35000
+```sh
+borehole start tcp 22                    # random remote port
+borehole start tcp 5432 --remote-port 35432   # fixed remote port
 ```
 
-The CLI checks that something is actually listening on the local port before it
-opens the tunnel. On success it prints the public address to share.
+### `borehole start http <port> [--remote-port <port>]`
 
-## Updating
+Same as `tcp`, but prints a ready-to-use `http://` URL in the banner.
 
-Check your installed version with `borehole --version`. On `borehole start` the
-CLI also warns when its version differs from the server's, and notifies you when
-a newer release is available.
-
-### CLI
-
-```bash
-borehole update
+```sh
+borehole start http 3000
+# ✓ Túnel activo
+#   url → http://your-vps:31180
 ```
 
-Downloads the latest matching binary from GitHub Releases and replaces the
-running executable in place (Linux, macOS and Windows). Pin a version with
-`BOREHOLE_VERSION=v0.1.2 borehole update`.
+Press `Ctrl+C` to close the tunnel. If the server drops unexpectedly the client
+retries up to 3 times with a 3-second backoff before exiting.
 
-### Server
+## Use cases
 
-The server runs as an immutable Docker image, so it is updated by pulling the
-new image and recreating the container:
+**1. Remote SSH access to a machine without a public IP**
 
-```bash
-docker pull ghcr.io/llinguini/borehole-server:latest
-docker rm -f borehole-server
-docker run -d \
-  --name borehole-server \
-  --restart unless-stopped \
-  --network host \
-  -v /etc/borehole:/etc/borehole:ro \
-  ghcr.io/llinguini/borehole-server:latest
+```sh
+borehole start tcp 22 --remote-port 32222
+# then, from anywhere:
+ssh -p 32222 user@your-vps
 ```
 
-> Keep the server and CLI on the same version. The `Cargo.toml` version must
-> match the release tag; the pipeline injects the tag at build time so published
-> artifacts always report the right version.
+**2. Share a local HTTP dev server**
 
-## Configuration reference
-
-### Server — `/etc/borehole/config.json`
-
-See [`borehole.example.json`](borehole.example.json).
-
-| Field          | Type       | Description                                       |
-| -------------- | ---------- | ------------------------------------------------- |
-| `bind_control` | string     | Control-plane listen address, e.g. `0.0.0.0:7000` |
-| `port_range`   | `[u16,u16]`| Inclusive public port range for tunnels           |
-| `tokens`       | string[]   | Valid authentication tokens                       |
-| `tls.cert`     | string     | Path to the PEM certificate chain (`fullchain`)   |
-| `tls.key`      | string     | Path to the PEM private key                       |
-
-### Client — `~/.borehole.json`
-
-| Field         | Type   | Description                                  |
-| ------------- | ------ | -------------------------------------------- |
-| `server_addr` | string | `host:port` of the server (port defaults 7000)|
-| `token`       | string | Token presented to the server                |
-
-## Building from source
-
-Requires Rust >= 1.85 (some dependencies need the 2024 edition feature).
-
-```bash
-cargo build --release            # all crates
-cargo build --release -p cli     # just the borehole CLI
-cargo test --workspace           # run the test suite
+```sh
+python3 -m http.server 8080        # or your framework's dev server
+borehole start http 8080
+# open the printed http://your-vps:<port> URL
 ```
 
-The server Docker image is built with:
+**3. Receive GitHub webhooks on localhost**
 
-```bash
-docker build -f docker/Dockerfile -t borehole-server .
+```sh
+borehole start http 4000 --remote-port 34000
+# set the GitHub webhook URL to: http://your-vps:34000/webhook
 ```
 
-## Releases & CI
+## Architecture
 
-Pushing a version tag triggers
-[`.github/workflows/release.yml`](.github/workflows/release.yml):
+borehole has two planes. The **control plane** is one persistent TLS connection
+from the client to the server (`:7000`); the server uses it to push
+notifications when a visitor arrives. The **data plane** is a plain-TCP listener
+on the control port + 1 (`:7001`): for each visitor the client opens a fresh
+data connection, identifies it, and the server splices the visitor's socket to
+it. The client in turn splices that to the local service.
 
-```bash
-git tag v0.1.0 && git push origin v0.1.0
+```
+CLI ──────TLS──────▶ server:7000   (control: register, notifications)
+visitor ───────────▶ server:32847  (public tunnel port)
+server ──notify───▶ CLI
+CLI ──────TCP──────▶ server:7001   (data connection for that visitor)
+server ──splice───▶ visitor ⇄ data ⇄ CLI ──▶ localhost:port
 ```
 
-It builds the CLI for Linux (gnu + musl), macOS (Intel + Apple Silicon) and
-Windows, attaches the binaries to a **GitHub Release**, and builds and pushes the
-`borehole-server` image to **GHCR**.
+## Roadmap
 
-Make sure *Settings → Actions → General → Workflow permissions* is set to
-"Read and write". The GHCR package is private on first push; make it public in
-the package settings if you want anonymous `docker pull`.
-
-## Troubleshooting
-
-| Symptom                                   | Cause / fix                                                                 |
-| ----------------------------------------- | -------------------------------------------------------------------------- |
-| CLI: `invalid peer certificate: UnknownIssuer` | Server is not sending the full chain. Use `fullchain.pem` as `cert.pem`. |
-| Server log: `UnknownCA`                   | Same as above, seen from the server side.                                  |
-| CLI: `no local service is listening ...`  | Start your local service first, or use the right local port.               |
-| `config` warns it cannot connect          | Wrong host/port, port 7000 firewalled, or invalid token.                   |
-| Server killed / SSH drops on start        | OOM from publishing the huge port range with `-p`. Use `--network host`.    |
-| `docker pull` denied                      | Private GHCR package: `docker login ghcr.io`, or make the package public.   |
+- **v1**: TCP + HTTP tunnels, CLI, self-hosted server ✓
+- **v2**: web dashboard, multi-node edges, JWT auth
+- **v3**: ACME / Let's Encrypt certificates, metrics, rate limiting
 
 ## License
 
-Distributed under the GNU Affero General Public License v3.0. See
-[`LICENSE`](LICENSE).
+GNU AGPL-3.0. See [LICENSE](LICENSE).

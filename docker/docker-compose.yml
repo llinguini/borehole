@@ -1,22 +1,122 @@
-# Antes de levantar:
-# 1. Copia config.json a /etc/borehole/config.json en el VPS
-# 2. Coloca cert.pem y key.pem en /etc/borehole/
-# 3. docker compose up -d
+# Local full-flow stack for borehole. Run everything from the repo root.
+#
+# 1) Server + dashboard only (default):
+#
+#      docker compose -f docker/docker-compose.yml up --build
+#
+#    Then open http://localhost:8080 and log in with admin@localhost / admin.
+#    Open a tunnel from your HOST CLI (direct path, server binds the public port):
+#
+#      borehole config --server localhost:7000 --token dev-token-1234
+#      borehole start tcp <local-port> --remote-port 30001
+#      # reach it at localhost:30001; it shows up live in the dashboard.
+#
+# 2) Full automated end-to-end through an edge node (adds node + demo service +
+#    demo CLI that opens a tunnel for you):
+#
+#      docker compose -f docker/docker-compose.yml --profile demo up --build
+#
+#    The node appears under /nodes, a live tunnel appears under /tunnels, and the
+#    demo target is reachable at http://localhost:30100 (served via the node).
+#
+# TLS certs are generated automatically by the `certgen` service into
+# docker/certs/ on first run. `version:` is omitted (obsolete in Compose v2+).
 
 services:
-  borehole-server:
+  # One-shot: generate a self-signed cert/key into the shared certs dir if
+  # missing. CLIs and nodes accept any cert in dev, so a self-signed pair is fine.
+  certgen:
+    image: alpine:3.19
+    volumes:
+      - ./certs:/certs
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        apk add --no-cache openssl >/dev/null 2>&1
+        if [ ! -f /certs/cert.pem ]; then
+          openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+            -subj '/CN=borehole-server' \
+            -keyout /certs/key.pem -out /certs/cert.pem
+          echo 'certgen: generated self-signed certificate'
+        else
+          echo 'certgen: certificate already present'
+        fi
+
+  # Control plane + data plane + REST API + embedded dashboard, all in one binary.
+  server:
     image: borehole-server
-    # Build context is the repo root so the Dockerfile can copy the whole
-    # workspace; the Dockerfile path is relative to that context.
     build:
       context: ..
-      dockerfile: docker/Dockerfile
-    restart: unless-stopped
+      dockerfile: docker/Dockerfile.server
+    depends_on:
+      certgen:
+        condition: service_completed_successfully
     ports:
-      - "7000:7000"
-      - "30000-40000:30000-40000"
+      - "8080:8080" # dashboard + REST/SSE API
+      - "7000:7000" # control TLS
+      - "7001:7001" # data connections (direct path)
+      - "30000-30010:30000-30010" # public tunnel ports (direct path, host CLI)
     volumes:
-      # Config and TLS certificates, mounted read-only.
-      - /etc/borehole:/etc/borehole:ro
+      # Ready-to-run config and the generated certs (relative cert paths in the
+      # config resolve against WORKDIR /etc/borehole).
+      - ../borehole.example.json:/etc/borehole/config.json:ro
+      - ./certs:/etc/borehole/certs:ro
     environment:
       - RUST_LOG=info
+    restart: unless-stopped
+
+  # ----- demo profile: automated end-to-end through an edge node -------------
+
+  # Edge node ("the muscle"). Registers with the server and binds public tunnel
+  # ports on demand. Shows up under /nodes in the dashboard.
+  node:
+    image: borehole-node
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.node
+    profiles: ["demo"]
+    depends_on:
+      - server
+    ports:
+      - "30100:30100" # the demo tunnel's public port (bound by the node)
+    volumes:
+      - ./config/node.json:/etc/borehole/node.json:ro
+    environment:
+      - RUST_LOG=info
+    restart: unless-stopped
+
+  # A tiny HTTP service to expose through the tunnel. `whoami` listens on :80.
+  demo-target:
+    image: traefik/whoami
+    profiles: ["demo"]
+    restart: unless-stopped
+
+  # CLI runner: shares the demo target's network namespace so the CLI's hardcoded
+  # 127.0.0.1 reaches the target, then opens an HTTP tunnel on a fixed public
+  # port. With the node up, the server routes this tunnel through the node.
+  demo-cli:
+    image: borehole-node # same image; it also ships the `borehole` CLI
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.node
+    profiles: ["demo"]
+    depends_on:
+      - server
+      - node
+      - demo-target
+    network_mode: "service:demo-target"
+    entrypoint: ["/bin/sh", "-c"]
+    # Give the node a moment to register so the tunnel is routed through it
+    # (otherwise the server would bind the port itself, not the node).
+    command:
+      - |
+        borehole config --server server:7000 --token dev-token-1234
+        sleep 8
+        while true; do
+          borehole start http 80 --remote-port 30100
+          echo 'demo-cli: tunnel ended, retrying in 3s'
+          sleep 3
+        done
+    environment:
+      - RUST_LOG=info
+    restart: unless-stopped

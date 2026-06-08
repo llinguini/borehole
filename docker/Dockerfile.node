@@ -1,0 +1,46 @@
+# syntax=docker/dockerfile:1
+
+# ---------------------------------------------------------------------------
+# Stage 1: builder
+# ---------------------------------------------------------------------------
+# Builds BOTH the edge node (`borehole-node`) and the CLI (`borehole`). The
+# compose demo reuses this single image for the node service and for a small CLI
+# runner that opens a tunnel through it.
+#
+# Rust >= 1.85 is REQUIRED (edition2024 transitive features). cmake/perl are
+# needed by aws-lc-sys (rustls 0.23 / aws-lc-rs).
+FROM rust:1.95-alpine AS builder
+
+RUN apk add --no-cache musl-dev build-base pkgconfig openssl-dev cmake perl
+
+WORKDIR /app
+
+# Copy the whole workspace (see .dockerignore for exclusions). The dashboard is
+# not needed here: neither the node nor the CLI embed it.
+COPY . .
+
+ARG BOREHOLE_VERSION=""
+ENV BOREHOLE_VERSION=${BOREHOLE_VERSION}
+
+# Static musl binaries at target/release/{borehole-node,borehole}.
+RUN cargo build --release -p borehole-node -p borehole
+
+# ---------------------------------------------------------------------------
+# Stage 2: runtime
+# ---------------------------------------------------------------------------
+FROM alpine:3.19
+
+# ca-certificates for TLS trust roots; openssl kept available for ops/debug.
+RUN apk add --no-cache ca-certificates openssl
+
+COPY --from=builder /app/target/release/borehole-node /usr/local/bin/
+COPY --from=builder /app/target/release/borehole /usr/local/bin/
+
+# Config lives here (mounted at runtime). WORKDIR keeps relative paths sane.
+RUN mkdir -p /etc/borehole
+WORKDIR /etc/borehole
+
+# Data port advertised to the server / dialed by CLIs.
+EXPOSE 7002
+
+CMD ["borehole-node", "--config", "/etc/borehole/node.json"]

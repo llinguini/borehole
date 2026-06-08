@@ -1,0 +1,17 @@
+# Keep the Docker build context small and free of build artifacts and secrets.
+target/
+**/target/
+.git/
+.github/
+# Web artifacts: dependencies and the build output are regenerated inside the
+# image (npm ci + build.rs `npm run build`), so don't ship the host copies.
+web/node_modules/
+web/build/
+web/.svelte-kit/
+**/node_modules/
+# TLS material must never be baked into image layers; mount it at runtime.
+certs/
+*.pem
+# Docs and logs are not needed to build.
+*.md
+*.log

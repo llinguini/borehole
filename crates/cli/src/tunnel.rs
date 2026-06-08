@@ -1,260 +1,259 @@
-// Connect to server and maintain tunnel
+// Tunnel client: the persistent TLS control connection plus the per-visitor
+// data connections.
+//
+// Flow: the CLI opens one TLS connection to the server control port, sends a
+// `Register`, and on success keeps listening for `NewConn` notifications. For
+// each `NewConn` it opens a *plain* TCP connection to the server data port
+// (control port + 1), announces the `conn_id` with a `DataConn` frame, dials
+// the local service, and splices both sockets together.
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use owo_colors::OwoColorize;
-use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, RootCertStore};
-use tokio::io::{copy_bidirectional, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
+use tracing::warn;
 
-use common::proto::{
-    decode, encode, ClientMsg, DataConn, NewConn, Ping, Register, Registered, ServerError,
-    ServerMsg,
-};
+use borehole_common::proto::{self, DataConn, Message, Protocol, Register, Registered};
 
-use crate::config::BoreholeConfig;
+use crate::config::CliConfig;
 
-/// Connects to the server, registers the tunnel and keeps it alive, spawning a
-/// data connection for every visitor the server announces.
+/// Opens the tunnel and runs the control loop until the server disconnects.
+///
+/// `node` is an optional preferred edge node name. `ready_tx`, when provided,
+/// receives the server-assigned remote port once registration succeeds (used by
+/// the background worker to update its record); it is ignored on failure.
 pub async fn run(
-    cfg: &BoreholeConfig,
-    protocol: &str,
     local_port: u16,
     remote_port: Option<u16>,
+    protocol: Protocol,
+    node: Option<String>,
+    ready_tx: Option<tokio::sync::oneshot::Sender<u16>>,
 ) -> Result<()> {
-    // 0. Fail fast if there is nothing to expose: the local service must be
-    //    reachable before we register a tunnel for it.
-    ensure_local_service(local_port).await?;
+    // 1. Load configuration.
+    let cfg = CliConfig::load()?;
+    let server_addr = cfg.require_server_addr()?;
+    let token = cfg.require_token()?;
+    let host = host_of(&server_addr).to_string();
 
-    // 1. Build the client-side TLS configuration from the system roots.
-    let connector = build_connector();
+    // 2-3. TLS handshake over a fresh TCP connection to the control port.
+    let connector = build_tls_connector()?;
+    let server_name = rustls::pki_types::ServerName::try_from(host.clone())
+        .context("invalid server hostname")?;
+    let tcp = TcpStream::connect(&server_addr)
+        .await
+        .with_context(|| format!("cannot connect to {server_addr}"))?;
+    let tls = connector
+        .connect(server_name, tcp)
+        .await
+        .context("TLS handshake failed")?;
 
-    // The server hostname is the part of `server_addr` before the port.
-    let server_ip = server_hostname(&cfg.server_addr);
-    let server_name =
-        ServerName::try_from(server_ip.clone()).context("invalid server hostname")?;
+    // 4. Split so we can read control frames and write requests independently.
+    let (read_half, mut write_half) = tokio::io::split(tls);
+    let mut reader = BufReader::new(read_half);
 
-    // 2. Open the control connection and complete the TLS handshake.
-    let mut stream = tls_connect(&connector, &server_name, &cfg.server_addr).await?;
-
-    // 3. Send the registration request, advertising our version.
-    let register = ClientMsg::Register(Register {
-        token: cfg.token.clone(),
-        protocol: protocol.to_string(),
+    // 5. Register. Include the host machine name so the dashboard can track
+    // this device (best-effort; `None` if it can't be resolved).
+    let hostname = hostname::get()
+        .ok()
+        .and_then(|name| name.into_string().ok());
+    let register = Message::Register(Register {
+        token,
+        protocol: protocol.clone(),
         local_port,
         remote_port,
-        client_version: crate::VERSION.to_string(),
+        node,
+        hostname,
     });
-    stream.write_all(encode(&register)?.as_bytes()).await?;
-    stream.flush().await?;
+    write_half
+        .write_all(proto::to_line(&register)?.as_bytes())
+        .await?;
+    write_half.flush().await?;
 
-    // 4. Read the server's response to the registration.
-    let mut reader = BufReader::new(stream);
+    // 6. Await the server's verdict.
     let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .await
-        .context("failed to read server response")?;
-
-    let (assigned_port, server_version) = match decode(line.trim_end())? {
-        ServerMsg::Error(ServerError { reason }) => return Err(anyhow!(reason)),
-        ServerMsg::Registered(Registered {
-            remote_port,
-            server_version,
-        }) => (remote_port, server_version),
-        other => bail!("unexpected response from server: {other:?}"),
+    reader.read_line(&mut line).await?;
+    let assigned_port = match proto::from_line(&line)? {
+        Message::Registered(Registered { remote_port, .. }) => remote_port,
+        Message::Error(err) => return Err(anyhow!(err.reason)),
+        _ => return Err(anyhow!("unexpected message from server")),
     };
 
-    print_banner(protocol, &server_ip, local_port, assigned_port);
-    warn_on_version_mismatch(&server_version);
-    spawn_update_check();
-
-    // 5. Keep listening for server notifications and serve each new visitor.
-    loop {
-        line.clear();
-        match reader.read_line(&mut line).await {
-            Ok(0) => break, // server closed the control connection
-            Ok(_) => {}
-            Err(_) => break,
-        }
-
-        let msg = match decode(line.trim_end()) {
-            Ok(msg) => msg,
-            Err(_) => break,
-        };
-
-        match msg {
-            ServerMsg::NewConn(NewConn { conn_id }) => {
-                let connector = connector.clone();
-                let server_name = server_name.clone();
-                let server_addr = cfg.server_addr.clone();
-                tokio::spawn(async move {
-                    let result =
-                        serve_conn(connector, server_name, server_addr, local_port, conn_id).await;
-                    if let Err(e) = result {
-                        eprintln!("data connection error: {e}");
-                    }
-                });
-            }
-            _ => break,
-        }
+    // Report the assigned port to a waiting background worker, if any.
+    if let Some(tx) = ready_tx {
+        let _ = tx.send(assigned_port);
     }
 
-    Ok(())
-}
-
-/// Extracts the hostname from a `host:port` address, used as the TLS
-/// `ServerName`. Falls back to the whole string when no port is present.
-fn server_hostname(server_addr: &str) -> String {
-    server_addr
-        .split(':')
-        .next()
-        .unwrap_or(server_addr)
-        .to_string()
-}
-
-/// Ensures a local service is listening on `127.0.0.1:local_port`. Connecting
-/// is the most reliable cross-platform check: a free port refuses the
-/// connection, so a successful connect proves something is listening.
-async fn ensure_local_service(local_port: u16) -> Result<()> {
-    TcpStream::connect(("127.0.0.1", local_port))
-        .await
-        .map(|_| ())
-        .with_context(|| {
-            format!(
-                "no local service is listening on 127.0.0.1:{local_port}; \
-                 start it before opening the tunnel"
-            )
-        })
-}
-
-/// Validates connectivity, TLS and the configured token by performing a
-/// `Ping`/`Pong` round-trip against the server. Returns an error describing the
-/// first failure (connection, TLS handshake, or rejected token). Acquires no
-/// port on the server, so it is safe to call from `borehole config`.
-pub async fn check_server(cfg: &BoreholeConfig) -> Result<()> {
-    let connector = build_connector();
-    let server_ip = server_hostname(&cfg.server_addr);
-    let server_name =
-        ServerName::try_from(server_ip).context("invalid server hostname")?;
-
-    let mut stream = tls_connect(&connector, &server_name, &cfg.server_addr).await?;
-
-    let ping = ClientMsg::Ping(Ping {
-        token: cfg.token.clone(),
-    });
-    stream.write_all(encode(&ping)?.as_bytes()).await?;
-    stream.flush().await?;
-
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .await
-        .context("failed to read server response")?;
-
-    match decode(line.trim_end())? {
-        ServerMsg::Pong => Ok(()),
-        ServerMsg::Error(ServerError { reason }) => Err(anyhow!(reason)),
-        other => bail!("unexpected response from server: {other:?}"),
-    }
-}
-
-/// Builds a `TlsConnector` trusting the system's root certificates.
-fn build_connector() -> TlsConnector {
-    let mut roots = RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    let config = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-
-    TlsConnector::from(Arc::new(config))
-}
-
-/// Opens a TCP connection to `addr` and performs the TLS handshake against
-/// `server_name`.
-async fn tls_connect(
-    connector: &TlsConnector,
-    server_name: &ServerName<'static>,
-    addr: &str,
-) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
-    let tcp = TcpStream::connect(addr)
-        .await
-        .with_context(|| format!("cannot connect to {addr}"))?;
-    connector
-        .connect(server_name.clone(), tcp)
-        .await
-        .context("TLS handshake failed")
-}
-
-/// Serves a single visitor connection: opens a fresh TLS data connection,
-/// identifies it with `conn_id`, then splices it to the local service.
-async fn serve_conn(
-    connector: TlsConnector,
-    server_name: ServerName<'static>,
-    server_addr: String,
-    local_port: u16,
-    conn_id: String,
-) -> Result<()> {
-    let mut server_stream = tls_connect(&connector, &server_name, &server_addr).await?;
-
-    let data_conn = ClientMsg::DataConn(DataConn { conn_id });
-    server_stream.write_all(encode(&data_conn)?.as_bytes()).await?;
-    server_stream.flush().await?;
-
-    let mut local_stream = TcpStream::connect(format!("127.0.0.1:{local_port}"))
-        .await
-        .with_context(|| format!("cannot reach local service on port {local_port}"))?;
-
-    copy_bidirectional(&mut server_stream, &mut local_stream).await?;
-    Ok(())
-}
-
-/// Warns when the CLI and server report different versions. The protocol is
-/// backward compatible, so this is informational only (empty = unknown peer).
-fn warn_on_version_mismatch(server_version: &str) {
-    if !server_version.is_empty() && server_version != crate::VERSION {
-        eprintln!(
-            "{} CLI v{} and server v{} differ; consider updating both",
-            "⚠".yellow(),
-            crate::VERSION,
-            server_version
+    // Banner. Labels dimmed, remote address/URL in brand blue (#5B8DEF,
+    // approximated by the terminal's bright blue).
+    println!("{}", "✓ Túnel activo".green());
+    println!("  {} localhost:{local_port}", "local  →".dimmed());
+    println!(
+        "  {} {}",
+        "remoto →".dimmed(),
+        format!("{host}:{assigned_port}").bright_blue()
+    );
+    if matches!(protocol, Protocol::Http) {
+        println!(
+            "  {} {}",
+            "url    →".dimmed(),
+            format!("http://{host}:{assigned_port}").bright_blue()
         );
     }
-}
+    println!("\n  {}", "Ctrl+C para cerrar".dimmed());
 
-/// Spawns a best-effort, time-bounded check for a newer CLI release. Any
-/// failure (offline, rate-limited, parse error) is silently ignored so it never
-/// interferes with the tunnel.
-fn spawn_update_check() {
-    tokio::spawn(async {
-        let check = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            tokio::task::spawn_blocking(crate::update::check_newer),
-        )
-        .await;
-
-        if let Ok(Ok(Ok(Some(latest)))) = check {
-            eprintln!(
-                "{} A new version v{latest} is available. Run `borehole update`.",
-                "↑".green()
-            );
+    // 7. Control loop: spawn a data connection for every incoming visitor, and
+    // shut down cleanly on Ctrl+C. A line-based reader lets us await frames.
+    let mut lines = reader.lines();
+    loop {
+        tokio::select! {
+            // Graceful shutdown: not an error, so no reconnection is attempted.
+            _ = tokio::signal::ctrl_c() => {
+                println!("\n{}", "✗ Túnel cerrado".red());
+                return Ok(());
+            }
+            next = lines.next_line() => {
+                match next {
+                    Ok(Some(line)) => match proto::from_line(&line) {
+                        Ok(Message::NewConn(new_conn)) => {
+                            let server_addr = server_addr.clone();
+                            let conn_id = new_conn.conn_id;
+                            let node = new_conn.node_host.zip(new_conn.node_port);
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    handle_data_conn(server_addr, conn_id, local_port, node).await
+                                {
+                                    warn!("data connection error: {e}");
+                                }
+                            });
+                        }
+                        Ok(other) => warn!("unexpected control message: {other:?}"),
+                        Err(e) => warn!("malformed control message: {e}"),
+                    },
+                    // Unexpected close: surface an error so `start` can retry.
+                    Ok(None) => return Err(anyhow!("servidor desconectado")),
+                    Err(e) => return Err(e).context("control channel read failed"),
+                }
+            }
         }
-    });
+    }
 }
 
-/// Prints the success banner once the tunnel is established.
-fn print_banner(protocol: &str, server_ip: &str, local_port: u16, remote_port: u16) {
-    let local_url = format!("localhost:{local_port}");
-    let remote_url = format!("{protocol}://{server_ip}:{remote_port}");
+/// Serves a single visitor: plain TCP to the data endpoint, announce the
+/// `conn_id`, dial the local service, then splice both ends.
+///
+/// `node` is `Some((host, port))` for a multi-node tunnel (dial the edge node
+/// directly) or `None` for the single-node path (dial the server's data port).
+async fn handle_data_conn(
+    server_addr: String,
+    conn_id: String,
+    local_port: u16,
+    node: Option<(String, u16)>,
+) -> Result<()> {
+    // 1. Plain TCP to the data endpoint (node when present, else the server's
+    // data port = control port + 1). No TLS on the data plane.
+    let data_addr = match node {
+        Some((host, port)) => format!("{host}:{port}"),
+        None => data_addr_of(&server_addr)?,
+    };
+    let mut server_conn = TcpStream::connect(&data_addr)
+        .await
+        .with_context(|| format!("cannot connect to data endpoint {data_addr}"))?;
 
-    println!("{} Túnel activo", "✓".green());
-    println!("  local   → {}", local_url.cyan());
-    println!("  remoto  → {}", remote_url.cyan());
-    println!();
-    println!("  Ctrl+C para cerrar");
+    // 2. Identify which visitor this connection serves.
+    let frame = proto::to_line(&Message::DataConn(DataConn { conn_id }))?;
+    server_conn.write_all(frame.as_bytes()).await?;
+    server_conn.flush().await?;
+
+    // 3. Connect to the locally exposed service.
+    let mut local = TcpStream::connect(("127.0.0.1", local_port))
+        .await
+        .with_context(|| format!("cannot reach local service on 127.0.0.1:{local_port}"))?;
+
+    // 4. Pipe bytes both ways until either side closes.
+    tokio::io::copy_bidirectional(&mut server_conn, &mut local).await?;
+    Ok(())
+}
+
+/// Builds a TLS client connector.
+///
+/// TODO: validate the server certificate in production. For v1/development this
+/// accepts any certificate so self-signed setups work out of the box.
+fn build_tls_connector() -> Result<TlsConnector> {
+    // rustls 0.23 needs a process-level crypto provider; standardise on
+    // aws-lc-rs. Ignore the error if one is already installed.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(danger::NoCertVerifier))
+        .with_no_client_auth();
+    Ok(TlsConnector::from(Arc::new(config)))
+}
+
+/// Returns the host part of a `host:port` address.
+fn host_of(addr: &str) -> &str {
+    addr.rsplit_once(':').map(|(host, _)| host).unwrap_or(addr)
+}
+
+/// Derives the data address (`host:control_port+1`) from the control address.
+fn data_addr_of(addr: &str) -> Result<String> {
+    let (host, port) = addr
+        .rsplit_once(':')
+        .context("server address must be host:port")?;
+    let port: u16 = port.parse().context("invalid server port")?;
+    Ok(format!("{host}:{}", port.saturating_add(1)))
+}
+
+/// Dangerous TLS verifier that accepts any certificate.
+///
+/// TODO: replace with real certificate validation (webpki roots or a pinned CA)
+/// before production use. Scoped to its own module to keep the unsafe-by-policy
+/// surface obvious.
+mod danger {
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{DigitallySignedStruct, Error, SignatureScheme};
+
+    #[derive(Debug)]
+    pub struct NoCertVerifier;
+
+    impl ServerCertVerifier for NoCertVerifier {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            rustls::crypto::aws_lc_rs::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
 }

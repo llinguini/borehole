@@ -1,0 +1,7 @@
+{
+  "server_addr": "1.2.3.4:7000",
+  "token": "dev-token-1234",
+  "name": "fra1",
+  "data_port": 7002,
+  "data_bind": "0.0.0.0:7002"
+}

@@ -1,268 +1,289 @@
-// Protocol message types
+// Borehole control protocol (v2)
 //
-// Messages are exchanged as newline-delimited JSON objects over a TLS
-// connection. Every message carries a `"type"` field acting as the
-// discriminant, which maps to the `serde` internally-tagged enum below.
+// The control plane is a persistent TLS connection carrying newline-delimited
+// JSON objects. Every frame is one JSON value terminated by '\n'. All messages
+// are wrapped in the `Message` envelope: an internally-tagged enum whose
+// `"type"` field selects the variant, so a single reader can decode any message
+// arriving on the channel.
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
-/// First message a client sends right after connecting. It authenticates the
-/// client and describes the tunnel it wants to establish.
-#[derive(Debug, Serialize, Deserialize)]
+/// Tunnel protocol requested by the CLI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    Tcp,
+    Http,
+}
+
+/// Sent by the CLI to the server to open a tunnel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Register {
-    /// Authentication token presented by the client.
     pub token: String,
-    /// Tunnel protocol. Expected values: "tcp" or "http".
-    pub protocol: String,
-    /// Local port on the client side that traffic is forwarded to.
+    pub protocol: Protocol,
     pub local_port: u16,
-    /// Desired public port on the server. `None` lets the server pick a
-    /// random free port.
+    /// `None` lets the server assign a port from its pool.
     pub remote_port: Option<u16>,
-    /// Client (CLI) version, e.g. "0.1.0". Empty when talking to/from an older
-    /// build that predates version reporting. `#[serde(default)]` keeps the
-    /// wire format backward compatible.
+    /// v2: preferred edge node name (e.g. "frankfurt"); `None` lets the server
+    /// pick the least-loaded node (or the direct path when no node is up).
     #[serde(default)]
-    pub client_version: String,
+    pub node: Option<String>,
+    /// v2: CLI host machine name, so the server can track devices. `None` from
+    /// older CLIs.
+    #[serde(default)]
+    pub hostname: Option<String>,
 }
 
-/// Sent by the client over a freshly opened second TCP connection to bind it
-/// to a pending data stream previously announced by the server.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DataConn {
-    /// Identifier (UUID v4) the server sent earlier in a `NewConn` message.
-    pub conn_id: String,
-}
-
-/// Sent by the client to check connectivity and validate its token without
-/// establishing a tunnel. The server answers with `Pong` on success or
-/// `Error` if the token is rejected. Unlike `Register`, this acquires no port
-/// and opens no public listener, so it is free of side effects.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Ping {
-    /// Authentication token to validate against the server's token set.
-    pub token: String,
-}
-
-/// Envelope for every message the client (CLI) sends to the server.
-///
-/// Serialized as an internally-tagged enum: the `"type"` field selects the
-/// variant and its value is the snake_case form of the variant name.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ClientMsg {
-    Register(Register),
-    DataConn(DataConn),
-    Ping(Ping),
-}
-
-/// Confirms a successful `Register` and reports the public port bound to the
-/// tunnel (useful when the client let the server pick a random one).
-#[derive(Debug, Serialize, Deserialize)]
+/// Server reply after a successful `Register`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Registered {
-    /// Public port the server assigned to the tunnel.
     pub remote_port: u16,
-    /// Server version, e.g. "0.1.0". Empty when the server predates version
-    /// reporting. `#[serde(default)]` keeps the wire format backward compatible.
-    #[serde(default)]
-    pub server_version: String,
+    /// v2: populated when the tunnel is hosted on a node; `None` in v1.
+    pub node_host: Option<String>,
+    pub node_port: Option<u16>,
 }
 
-/// Notifies the client that an external connection reached the tunnel's public
-/// port. The client is expected to open a data connection echoing `conn_id`.
-#[derive(Debug, Serialize, Deserialize)]
+/// Server -> CLI: an external connection arrived; open a data connection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewConn {
-    /// Unique identifier (UUID v4) for this incoming connection.
+    /// UUID v4 identifying the incoming connection.
+    pub conn_id: String,
+    /// v2: which node to open the `DataConn` against; `None` => the server.
+    pub node_host: Option<String>,
+    pub node_port: Option<u16>,
+}
+
+/// CLI -> server: a second TCP connection identifying which `conn_id` it serves.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataConn {
     pub conn_id: String,
 }
 
-/// Reports a server-side error, e.g. an invalid token.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ServerError {
-    /// Human-readable explanation of the failure.
+/// v2 — node -> server: a visitor reached the public port.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisitorConn {
+    pub tunnel_id: String,
+    pub conn_id: String,
+}
+
+/// v2 — node registration request to the server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterNode {
+    pub token: String,
+    /// Node name, e.g. "frankfurt".
+    pub name: String,
+    /// Plain-TCP port where the node accepts `DataConn` connections from CLIs.
+    /// The server advertises it to CLIs (as `node_port`) so they dial the node
+    /// directly for the data plane.
+    pub data_port: u16,
+}
+
+/// v2 — server reply to a `RegisterNode`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeRegistered {
+    pub node_id: String,
+}
+
+/// v2 — server -> node: open a public tunnel listener for `tunnel_id` on
+/// `remote_port`. The node binds the port and reports visitors via `VisitorConn`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenTunnel {
+    pub tunnel_id: String,
+    pub remote_port: u16,
+}
+
+/// v2 — server -> node: tear down `tunnel_id` (the owning CLI disconnected).
+/// The node drops the public listener, freeing the port.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloseTunnel {
+    pub tunnel_id: String,
+}
+
+/// Generic error, server -> client.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorMsg {
     pub reason: String,
 }
 
-/// Envelope for every message the server sends to the client (CLI).
-///
-/// Serialized as an internally-tagged enum: the `"type"` field selects the
-/// variant and its value is the snake_case form of the variant name.
-#[derive(Debug, Serialize, Deserialize)]
+/// Envelope wrapping every message exchanged on the control channel. The
+/// `"type"` field (snake_case variant name) selects the payload, so any message
+/// can be decoded without knowing it in advance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum ServerMsg {
+pub enum Message {
+    Register(Register),
     Registered(Registered),
     NewConn(NewConn),
-    /// Successful reply to a `Ping`: connectivity and token are valid.
-    Pong,
-    #[serde(rename = "error")]
-    Error(ServerError),
+    DataConn(DataConn),
+    VisitorConn(VisitorConn),
+    RegisterNode(RegisterNode),
+    NodeRegistered(NodeRegistered),
+    OpenTunnel(OpenTunnel),
+    CloseTunnel(CloseTunnel),
+    Error(ErrorMsg),
 }
 
-/// Serializes `msg` to JSON and appends a trailing '\n', producing a frame
-/// ready to be written to the socket (newline-delimited JSON framing).
-///
-/// Generic over any `Serialize` type, so it is decoupled from the concrete
-/// message enums.
-pub fn encode<T: Serialize>(msg: &T) -> Result<String, serde_json::Error> {
-    let mut framed = serde_json::to_string(msg)?;
-    framed.push('\n');
-    Ok(framed)
+/// Serializes a message to JSON and appends a trailing '\n', producing a frame
+/// ready to write to the control socket (newline-delimited JSON framing).
+pub fn to_line(msg: &Message) -> Result<String> {
+    let mut line = serde_json::to_string(msg).context("failed to serialize message")?;
+    line.push('\n');
+    Ok(line)
 }
 
-/// Deserializes a single line (with the trailing '\n' already stripped) into
-/// the requested type `T`.
-///
-/// Generic over any `DeserializeOwned` type, so it is decoupled from the
-/// concrete message enums.
-pub fn decode<T: DeserializeOwned>(line: &str) -> Result<T, serde_json::Error> {
-    serde_json::from_str(line)
+/// Deserializes a single JSON frame into a `Message`. A trailing newline (or
+/// other surrounding whitespace) is tolerated.
+pub fn from_line(line: &str) -> Result<Message> {
+    serde_json::from_str(line.trim()).context("failed to deserialize message")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn register_serializes_with_type_tag() {
-        let msg = ClientMsg::Register(Register {
-            token: "secret".to_string(),
-            protocol: "tcp".to_string(),
-            local_port: 8080,
-            remote_port: None,
-            client_version: "0.1.0".to_string(),
-        });
+    /// Round-trips a message through `to_line`/`from_line` and asserts the
+    /// decoded value re-serializes identically. `Message` does not derive
+    /// `PartialEq`, so we compare the canonical JSON instead.
+    fn assert_roundtrip(msg: Message, expected_type: &str) {
+        let line = to_line(&msg).expect("to_line must succeed");
+        assert!(line.ends_with('\n'), "frame must end with a newline: {line:?}");
+        assert!(
+            line.contains(&format!(r#""type":"{expected_type}""#)),
+            "missing type tag '{expected_type}' in: {line}"
+        );
 
-        let json = serde_json::to_string(&msg).expect("serialization must succeed");
-
-        assert!(json.contains(r#""type":"register""#), "got: {json}");
+        let back = from_line(&line).expect("from_line must succeed");
+        assert_eq!(
+            serde_json::to_string(&msg).unwrap(),
+            serde_json::to_string(&back).unwrap(),
+            "round-trip changed the message"
+        );
     }
 
     #[test]
-    fn register_without_version_deserializes() {
-        // Older clients omit `client_version`; it must default to empty.
-        let json = r#"{"type":"register","token":"t","protocol":"tcp","local_port":80,"remote_port":null}"#;
+    fn register_roundtrips() {
+        assert_roundtrip(
+            Message::Register(Register {
+                token: "secret".into(),
+                protocol: Protocol::Tcp,
+                local_port: 8080,
+                remote_port: None,
+                node: None,
+                hostname: None,
+            }),
+            "register",
+        );
+    }
 
-        let msg: ClientMsg = serde_json::from_str(json).expect("deserialization must succeed");
+    #[test]
+    fn registered_roundtrips() {
+        assert_roundtrip(
+            Message::Registered(Registered {
+                remote_port: 32847,
+                node_host: Some("fra1.example.com".into()),
+                node_port: Some(40000),
+            }),
+            "registered",
+        );
+    }
 
-        match msg {
-            ClientMsg::Register(reg) => assert_eq!(reg.client_version, ""),
-            other => panic!("expected Register, got: {other:?}"),
-        }
+    #[test]
+    fn new_conn_roundtrips() {
+        assert_roundtrip(
+            Message::NewConn(NewConn {
+                conn_id: "11111111-1111-4111-8111-111111111111".into(),
+                node_host: None,
+                node_port: None,
+            }),
+            "new_conn",
+        );
     }
 
     #[test]
     fn data_conn_roundtrips() {
-        let msg = ClientMsg::DataConn(DataConn {
-            conn_id: "11111111-1111-4111-8111-111111111111".to_string(),
-        });
-
-        let json = serde_json::to_string(&msg).expect("serialization must succeed");
-        let back: ClientMsg = serde_json::from_str(&json).expect("deserialization must succeed");
-
-        assert!(matches!(back, ClientMsg::DataConn(_)));
+        assert_roundtrip(
+            Message::DataConn(DataConn {
+                conn_id: "abc-123".into(),
+            }),
+            "data_conn",
+        );
     }
 
     #[test]
-    fn registered_serializes_with_type_and_port() {
-        let msg = ServerMsg::Registered(Registered {
-            remote_port: 32847,
-            server_version: "0.1.0".to_string(),
-        });
-
-        let json = serde_json::to_string(&msg).expect("serialization must succeed");
-
-        assert!(json.contains(r#""type":"registered""#), "got: {json}");
-        assert!(json.contains(r#""remote_port":32847"#), "got: {json}");
+    fn visitor_conn_roundtrips() {
+        assert_roundtrip(
+            Message::VisitorConn(VisitorConn {
+                tunnel_id: "tunnel-1".into(),
+                conn_id: "abc-123".into(),
+            }),
+            "visitor_conn",
+        );
     }
 
     #[test]
-    fn registered_without_version_deserializes() {
-        // Older servers omit `server_version`; it must default to empty.
-        let json = r#"{"type":"registered","remote_port":32847}"#;
-
-        let msg: ServerMsg = serde_json::from_str(json).expect("deserialization must succeed");
-
-        match msg {
-            ServerMsg::Registered(r) => assert_eq!(r.server_version, ""),
-            other => panic!("expected Registered, got: {other:?}"),
-        }
+    fn register_node_roundtrips() {
+        assert_roundtrip(
+            Message::RegisterNode(RegisterNode {
+                token: "node-token".into(),
+                name: "frankfurt".into(),
+                data_port: 7001,
+            }),
+            "register_node",
+        );
     }
 
     #[test]
-    fn new_conn_deserializes() {
-        let json = r#"{"type":"new_conn","conn_id":"abc-123"}"#;
-
-        let msg: ServerMsg = serde_json::from_str(json).expect("deserialization must succeed");
-
-        match msg {
-            ServerMsg::NewConn(NewConn { conn_id }) => assert_eq!(conn_id, "abc-123"),
-            other => panic!("expected NewConn, got: {other:?}"),
-        }
+    fn node_registered_roundtrips() {
+        assert_roundtrip(
+            Message::NodeRegistered(NodeRegistered {
+                node_id: "node-uuid".into(),
+            }),
+            "node_registered",
+        );
     }
 
     #[test]
-    fn error_deserializes() {
-        let json = r#"{"type":"error","reason":"invalid token"}"#;
-
-        let msg: ServerMsg = serde_json::from_str(json).expect("deserialization must succeed");
-
-        match msg {
-            ServerMsg::Error(ServerError { reason }) => assert_eq!(reason, "invalid token"),
-            other => panic!("expected Error, got: {other:?}"),
-        }
+    fn error_roundtrips() {
+        assert_roundtrip(
+            Message::Error(ErrorMsg {
+                reason: "invalid token".into(),
+            }),
+            "error",
+        );
     }
 
     #[test]
-    fn ping_serializes_with_type_tag() {
-        let msg = ClientMsg::Ping(Ping {
-            token: "secret".to_string(),
-        });
-
-        let json = serde_json::to_string(&msg).expect("serialization must succeed");
-
-        assert!(json.contains(r#""type":"ping""#), "got: {json}");
-        assert!(json.contains(r#""token":"secret""#), "got: {json}");
+    fn open_tunnel_roundtrips() {
+        assert_roundtrip(
+            Message::OpenTunnel(OpenTunnel {
+                tunnel_id: "tunnel-1".into(),
+                remote_port: 32847,
+            }),
+            "open_tunnel",
+        );
     }
 
     #[test]
-    fn pong_serializes_as_bare_tag() {
-        let json = serde_json::to_string(&ServerMsg::Pong).expect("serialization must succeed");
-
-        assert_eq!(json, r#"{"type":"pong"}"#);
+    fn close_tunnel_roundtrips() {
+        assert_roundtrip(
+            Message::CloseTunnel(CloseTunnel {
+                tunnel_id: "tunnel-1".into(),
+            }),
+            "close_tunnel",
+        );
     }
 
     #[test]
-    fn pong_deserializes() {
-        let msg: ServerMsg =
-            serde_json::from_str(r#"{"type":"pong"}"#).expect("deserialization must succeed");
-
-        assert!(matches!(msg, ServerMsg::Pong));
+    fn protocol_serializes_lowercase() {
+        let json = serde_json::to_string(&Protocol::Http).unwrap();
+        assert_eq!(json, r#""http""#);
     }
 
     #[test]
-    fn encode_decode_roundtrip() {
-        let original = ClientMsg::Register(Register {
-            token: "secret".to_string(),
-            protocol: "http".to_string(),
-            local_port: 3000,
-            remote_port: Some(9000),
-            client_version: "0.1.0".to_string(),
-        });
-
-        let framed = encode(&original).expect("encode must succeed");
-        assert!(framed.ends_with('\n'), "frame must end with a newline");
-
-        let line = framed.trim_end_matches('\n');
-        let decoded: ClientMsg = decode(line).expect("decode must succeed");
-
-        match (original, decoded) {
-            (ClientMsg::Register(a), ClientMsg::Register(b)) => {
-                assert_eq!(a.token, b.token);
-                assert_eq!(a.protocol, b.protocol);
-                assert_eq!(a.local_port, b.local_port);
-                assert_eq!(a.remote_port, b.remote_port);
-            }
-            _ => panic!("expected a Register variant on both sides"),
-        }
+    fn from_line_tolerates_trailing_newline() {
+        let msg = from_line("{\"type\":\"data_conn\",\"conn_id\":\"x\"}\n")
+            .expect("must parse with trailing newline");
+        assert!(matches!(msg, Message::DataConn(_)));
     }
 }

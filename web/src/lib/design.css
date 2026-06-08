@@ -1,0 +1,33 @@
+/* borehole design tokens — from borehole-design-profile.md */
+:root {
+	--bh-ink: #0a0b0d;
+	--bh-ink2: #0d0f13;
+	--bh-ink3: #121519;
+	--bh-ink4: #181c22;
+	--bh-line: rgba(232, 236, 242, 0.085);
+	--bh-line2: rgba(232, 236, 242, 0.17);
+	--bh-fg: #e7e9ee;
+	--bh-dim: #878d97;
+	--bh-faint: #535963;
+	--bh-blue: #5b8def;
+	--bh-blue-bright: #82a8ff;
+	--bh-blue-dim: rgba(91, 141, 239, 0.13);
+	--bh-up: #52b486;
+	--bh-warn: #d6a341;
+	--bh-down: #d76a5c;
+	--bh-mono: 'IBM Plex Mono', ui-monospace, monospace;
+	--bh-disp: 'Martian Mono', ui-monospace, monospace;
+}
+
+body {
+	background: var(--bh-ink);
+	color: var(--bh-fg);
+	font-family: var(--bh-mono);
+	font-size: 13px;
+	line-height: 1.6;
+}
+
+* {
+	box-sizing: border-box;
+	border-radius: 0;
+}

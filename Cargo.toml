@@ -2,8 +2,9 @@
 resolver = "2"
 members = [
     "crates/common",
-    "crates/cli",
     "crates/server",
+    "crates/cli",
+    "crates/node",
 ]
 
 # Shared package metadata inherited by every member via `field.workspace = true`.

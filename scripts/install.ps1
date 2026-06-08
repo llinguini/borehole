@@ -1,7 +1,7 @@
 # borehole CLI installer for Windows (PowerShell).
 #
 # Downloads the prebuilt borehole.exe from the GitHub Releases of this
-# repository, installs it under %LOCALAPPDATA%\Programs\borehole and adds that
+# repository, installs it under %LOCALAPPDATA%\borehole and adds that
 # directory to the user PATH so it can be run as `borehole`.
 #
 # Usage:
@@ -19,7 +19,7 @@ $version = if ($env:BOREHOLE_VERSION) { $env:BOREHOLE_VERSION } else { 'latest' 
 # Only x86_64 Windows is published today.
 $arch = $env:PROCESSOR_ARCHITECTURE
 if ($arch -ne 'AMD64') {
-    throw "unsupported architecture: $arch (only x86_64 Windows is published)"
+    throw "arquitectura no soportada: $arch (solo se publica x86_64 Windows)"
 }
 
 $asset = 'borehole-x86_64-pc-windows-msvc.exe'
@@ -29,14 +29,14 @@ $url = if ($version -eq 'latest') {
     "https://github.com/$repo/releases/download/$version/$asset"
 }
 
-$installDir = Join-Path $env:LOCALAPPDATA 'Programs\borehole'
+$installDir = Join-Path $env:LOCALAPPDATA 'borehole'
 $dest = Join-Path $installDir 'borehole.exe'
 
-Write-Host "Downloading $asset ($version)..."
+Write-Host "Descargando $asset ($version)..."
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 Invoke-WebRequest -Uri $url -OutFile $dest
 
-Write-Host "Installed borehole to $dest"
+Write-Host "✓ borehole instalado en $dest"
 
 # Add the install directory to the user PATH if it is not already present.
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -48,9 +48,9 @@ if (-not ($userPath -split ';' | Where-Object { $_ -eq $installDir })) {
     }
     [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
     Write-Host ""
-    Write-Host "Added $installDir to your user PATH."
-    Write-Host "Restart your terminal for the change to take effect."
+    Write-Host "Añadido $installDir a tu PATH de usuario."
+    Write-Host "Reinicia la terminal para aplicar el cambio."
 }
 
 Write-Host ""
-Write-Host "Run 'borehole config' to get started."
+Write-Host "Ejecuta: borehole config"

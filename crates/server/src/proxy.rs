@@ -1,26 +1,29 @@
-// Bidirectional TCP proxy
+// Bidirectional TCP proxy between the external visitor and the CLI data socket.
 //
-// Splices two streams together, forwarding bytes in both directions until
-// either side closes. Used to glue an external (plain TCP) visitor connection
-// to the client's (TLS) data connection, so the two endpoints may differ in
-// type; hence the generic parameters.
+// `copy_bidirectional` does all the work: it forwards bytes both ways until one
+// side closes, then reports how much was transferred in each direction.
 
-use tokio::io::{copy_bidirectional, AsyncRead, AsyncWrite};
+use tokio::io::copy_bidirectional;
+use tokio::net::TcpStream;
+use tracing::{debug, info};
 
-/// Pipes all traffic between `a` and `b` until one side closes, then logs the
-/// outcome. Errors are reported but not propagated, since each tunnel runs as
-/// an independent task.
-pub async fn pipe<A, B>(mut a: A, mut b: B)
-where
-    A: AsyncRead + AsyncWrite + Unpin,
-    B: AsyncRead + AsyncWrite + Unpin,
-{
-    match copy_bidirectional(&mut a, &mut b).await {
-        Ok((a_to_b, b_to_a)) => {
-            eprintln!("proxy closed: {a_to_b} bytes a->b, {b_to_a} bytes b->a");
-        }
-        Err(e) => {
-            eprintln!("proxy error: {e}");
-        }
-    }
+/// Pipes traffic between `visitor` (the external user that reached the public
+/// port) and `data_conn` (the data channel opened by the CLI) until either side
+/// closes the connection.
+pub async fn run(mut visitor: TcpStream, mut data_conn: TcpStream) -> anyhow::Result<()> {
+    // Peer addresses are best-effort: a socket may already be closed, in which
+    // case we log "unknown" rather than panicking.
+    let visitor_addr = visitor
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    let data_addr = data_conn
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    info!("proxy start: visitor={visitor_addr} data={data_addr}");
+
+    let (up, down) = copy_bidirectional(&mut visitor, &mut data_conn).await?;
+    debug!("proxy closed: {up}↑ {down}↓ bytes");
+    Ok(())
 }

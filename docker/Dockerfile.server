@@ -1,0 +1,57 @@
+# syntax=docker/dockerfile:1
+
+# ---------------------------------------------------------------------------
+# Stage 1: builder
+# ---------------------------------------------------------------------------
+# Rust >= 1.85 is REQUIRED: transitive deps (e.g. getrandom 0.4) need the
+# edition2024 Cargo feature, so a 1.77 base does NOT build. Pinned to the
+# verified local toolchain; bump as needed.
+FROM rust:1.95-alpine AS builder
+
+# Native build dependencies:
+#   - musl-dev / build-base: C/C++ toolchain (gcc, make) for native crates.
+#   - pkgconfig, openssl-dev: pkg-config metadata and headers.
+#   - cmake, perl: required to build aws-lc-sys, the C backend pulled in by
+#     rustls 0.23 (aws-lc-rs). Without these the release build fails.
+#   - nodejs, npm: the server's build.rs runs `npm run build` on a release build
+#     to compile the SvelteKit dashboard, which is then embedded via include_dir.
+RUN apk add --no-cache musl-dev build-base pkgconfig openssl-dev cmake perl nodejs npm
+
+WORKDIR /app
+
+# Copy the whole workspace (see .dockerignore for what is excluded; the web
+# build output and node_modules are regenerated below, not copied).
+COPY . .
+
+# Install the dashboard's dependencies so build.rs can run `npm run build`.
+RUN cd web && npm ci
+
+# Version reported by the binary. CI passes the release tag; defaults to empty
+# (build.rs then falls back to the crate version in Cargo.toml).
+ARG BOREHOLE_VERSION=""
+ENV BOREHOLE_VERSION=${BOREHOLE_VERSION}
+
+# rust:alpine targets x86_64-unknown-linux-musl by default, producing a
+# statically linked binary at target/release/borehole-server. The release
+# profile triggers build.rs to build and embed the dashboard.
+RUN cargo build --release -p borehole-server
+
+# ---------------------------------------------------------------------------
+# Stage 2: runtime
+# ---------------------------------------------------------------------------
+FROM alpine:3.19
+
+# ca-certificates for TLS trust roots; openssl kept available for ops/debug.
+RUN apk add --no-cache ca-certificates openssl
+
+COPY --from=builder /app/target/release/borehole-server /usr/local/bin/
+
+# Config and certs live here. WORKDIR makes the config's relative cert paths
+# (e.g. "certs/cert.pem") resolve under /etc/borehole when mounted at runtime.
+RUN mkdir -p /etc/borehole
+WORKDIR /etc/borehole
+
+# Control TLS, data connections, and the public tunnel port range.
+EXPOSE 7000 7001 30000-40000
+
+CMD ["borehole-server", "--config", "/etc/borehole/config.json"]

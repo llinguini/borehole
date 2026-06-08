@@ -3,8 +3,9 @@ name: Release
 # Publishes release artifacts when a version tag (e.g. v0.1.0) is pushed:
 #   - the `borehole` CLI as standalone binaries (one per target) attached
 #     directly to the GitHub Release.
-#   - the `borehole-server` Docker image to the GitHub Container Registry
-#     (ghcr.io), where it shows up under the repository "Packages" tab.
+#   - every other component (`borehole-server`, `borehole-node`) as a Docker
+#     image in the GitHub Container Registry (ghcr.io), under the repository
+#     "Packages" tab. The CLI is intentionally NOT shipped as an image.
 on:
   push:
     tags:
@@ -86,7 +87,7 @@ jobs:
           BOREHOLE_VERSION: ${{ github.ref_name }}
         run: >-
           cargo build --release --locked
-          -p cli --target ${{ matrix.target }}
+          -p borehole --target ${{ matrix.target }}
 
       # Copy the binary out under a per-target name so the Release assets do not
       # collide with each other.
@@ -109,15 +110,24 @@ jobs:
           fail_on_unmatched_files: true
 
   # ---------------------------------------------------------------------------
-  # Build and push the server image to ghcr.io. Uses the repository-scoped
-  # GITHUB_TOKEN, so no extra secrets are required.
+  # Build and push every non-CLI component as a Docker image to ghcr.io. One
+  # matrix job per component (server, node), each tagged independently. Uses the
+  # repository-scoped GITHUB_TOKEN, so no extra secrets are required.
   # ---------------------------------------------------------------------------
   docker:
-    name: Build & push server image
+    name: Build & push ${{ matrix.image }} image
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: borehole-server
+            dockerfile: docker/Dockerfile.server
+          - image: borehole-node
+            dockerfile: docker/Dockerfile.node
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -136,7 +146,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository_owner }}/borehole-server
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -146,11 +156,12 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: docker/Dockerfile
+          file: ${{ matrix.dockerfile }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             BOREHOLE_VERSION=${{ github.ref_name }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Per-image gha cache scope so server and node don't evict each other.
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}

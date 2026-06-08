@@ -1,9 +1,13 @@
 [package]
-name = "common"
-version.workspace = true
+name = "borehole-common"
+version = "0.1.0"
 edition = "2021"
 
+# Lib (import) name is `borehole_common`. Crates that prefer `use common::...`
+# alias it via `common = { path = "../common", package = "borehole-common" }`.
+
 [dependencies]
-serde = { workspace = true }
-serde_json = { workspace = true }
-uuid = { workspace = true }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
