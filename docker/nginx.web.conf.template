@@ -1,0 +1,41 @@
+# nginx config for the standalone dashboard image. Processed by the official
+# entrypoint's envsubst (only real env vars like ${BOREHOLE_API} are replaced;
+# nginx runtime vars such as $uri are left untouched).
+
+server {
+    listen 80;
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Docker's embedded DNS, so the backend hostname is resolved at REQUEST time
+    # (see the variable proxy_pass below). This lets nginx start even when the
+    # backend is down or not yet up; a literal proxy_pass would fail at boot.
+    resolver 127.0.0.11 ipv6=off valid=30s;
+
+    # Proxy the REST + SSE API to borehole-server so the SPA can use a
+    # same-origin base (VITE_API_URL empty).
+    location /api/ {
+        # Variable in proxy_pass forces runtime resolution; $request_uri keeps
+        # the full original path + query.
+        set $backend "${BOREHOLE_API}";
+        proxy_pass $backend$request_uri;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+        # Server-Sent Events (/api/events): stream without buffering and keep the
+        # connection open.
+        proxy_set_header Connection "";
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 1h;
+    }
+
+    # SPA: unknown paths fall back to the app shell for client-side routing.
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}

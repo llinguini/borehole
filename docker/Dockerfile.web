@@ -1,0 +1,42 @@
+# syntax=docker/dockerfile:1
+
+# ---------------------------------------------------------------------------
+# Stage 1: builder — compile the SvelteKit dashboard to static files.
+# ---------------------------------------------------------------------------
+# Build context is the repo root (see the pipeline / .dockerignore). Only the
+# web/ project is needed here; node_modules and build output are regenerated.
+FROM node:20-alpine AS builder
+
+WORKDIR /web
+
+# Install dependencies first for better layer caching (deps change rarely).
+COPY web/package.json web/package-lock.json web/.npmrc ./
+RUN npm ci
+
+# Build the SPA. VITE_API_URL is the API origin baked into the bundle; empty
+# (default) means same origin, which works because the runtime nginx below
+# proxies /api to the backend. Set it only for an unproxied separate origin.
+ARG VITE_API_URL=""
+ENV VITE_API_URL=${VITE_API_URL}
+
+# Accepted (and ignored) so the shared pipeline build-arg doesn't warn.
+ARG BOREHOLE_VERSION=""
+
+COPY web/ ./
+RUN npm run build
+
+# ---------------------------------------------------------------------------
+# Stage 2: runtime — serve the static build with nginx (SPA fallback + API
+# proxy). nginx's official entrypoint runs envsubst over *.template, so
+# ${BOREHOLE_API} is substituted at container start.
+# ---------------------------------------------------------------------------
+FROM nginx:1.27-alpine
+
+# Backend the dashboard's /api (REST + SSE) is proxied to. Override at runtime,
+# e.g. -e BOREHOLE_API=http://my-server:8080.
+ENV BOREHOLE_API="http://server:8080"
+
+COPY docker/nginx.web.conf.template /etc/nginx/templates/default.conf.template
+COPY --from=builder /web/build /usr/share/nginx/html
+
+EXPOSE 80

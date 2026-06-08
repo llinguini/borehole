@@ -24,10 +24,8 @@ jobs:
   build-cli:
     name: Build CLI (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
-    # Each matrix job uploads its own binary to the Release, so it needs write
-    # access to repository contents.
     permissions:
-      contents: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -94,14 +92,35 @@ jobs:
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" \
             "dist/${{ matrix.asset }}"
 
-      # Publish this target's binary to the Release as soon as it is built,
-      # instead of waiting for the whole matrix. The action is idempotent:
-      # whichever job runs first creates the Release, the rest just add their
-      # asset. This avoids a slow runner (e.g. macOS) blocking every upload.
-      - name: Publish binary to release
+      # Stage the binary as a workflow artifact. A single downstream job creates
+      # the GitHub Release and uploads every asset at once, avoiding the race
+      # when multiple matrix legs call action-gh-release in parallel (finalize
+      # fails with tag_name already_exists).
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          retention-days: 1
+
+  # One job owns release creation + all CLI asset uploads (no matrix races).
+  release-cli:
+    name: Publish CLI release
+    needs: build-cli
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download CLI binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/${{ matrix.asset }}
+          files: dist/**
           generate_release_notes: true
           fail_on_unmatched_files: true
 
@@ -124,6 +143,8 @@ jobs:
             dockerfile: docker/Dockerfile.server
           - image: borehole-node
             dockerfile: docker/Dockerfile.node
+          - image: borehole-web
+            dockerfile: docker/Dockerfile.web
     steps:
       - name: Checkout
         uses: actions/checkout@v4
