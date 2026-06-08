@@ -44,10 +44,6 @@ jobs:
             target: aarch64-apple-darwin
             bin: borehole
             asset: borehole-aarch64-apple-darwin
-          - os: macos-13
-            target: x86_64-apple-darwin
-            bin: borehole
-            asset: borehole-x86_64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             bin: borehole.exe
